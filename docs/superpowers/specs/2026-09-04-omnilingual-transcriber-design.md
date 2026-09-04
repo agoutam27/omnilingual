@@ -181,6 +181,8 @@ omnilingual transcribe RECORDING
 
 Progress: one line per chunk (`[12/146] 00:05:36 hi-IN 0.97`), final summary with cost. Exit code 0 on success, 2 on partial success (any segment not `ok`), 1 on fatal.
 
+Implementation note (2026-09-04): single root command; invocation is `omnilingual RECORDING`, no `transcribe` subcommand.
+
 ## 10. Testing
 
 - **Unit**
@@ -192,6 +194,8 @@ Progress: one line per chunk (`[12/146] 00:05:36 hi-IN 0.97`), final summary wit
 - **End-to-end**: 60-second synthetic three-language clip → full pipeline with mocked API → golden Markdown. Second run asserts zero HTTP calls (cache).
 - Development follows TDD per module.
 
+Implementation note (2026-09-04): test WAVs are synthesized in-process by `tests/conftest.make_wav` (tone/silence parts, configurable rate and channels) rather than checked in, so there is no `tests/fixtures/` directory. Golden Markdown lives in `tests/render/golden/`; recorded API JSON is inlined in the `respx` tests.
+
 ## 11. Project layout
 
 ```
@@ -200,9 +204,11 @@ omnilingual/
   README.md
   omnilingual/           # package (modules per §5)
   tests/
-    fixtures/            # short WAVs, recorded API JSON, golden markdown
+    render/golden/       # golden markdown
   docs/superpowers/specs/
 ```
+
+Implementation note (2026-09-04): no `tests/fixtures/` directory — WAVs are synthesized by `tests/conftest.make_wav` and API JSON is inlined in the tests. Tests otherwise mirror the package layout (`tests/audio/`, `tests/stt/`, `tests/translate/`, `tests/render/`).
 
 ## 12. Future extensions (not designed here)
 
