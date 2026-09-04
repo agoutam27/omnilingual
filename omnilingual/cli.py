@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, NoReturn, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from omnilingual.audio.normalize import FfmpegError, FfmpegMissingError, ensure_ffmpeg
 from omnilingual.cache import JsonCache
@@ -23,8 +24,15 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
 
 
-def _fail(msg: str, code: int = 1) -> None:
-    console.print(f"[red]error:[/red] {msg}")
+# Sarvam's synchronous speech-to-text endpoint rejects audio of 30 seconds or more.
+MAX_CHUNK_LIMIT_S = 30.0
+
+
+def _fail(msg: str, code: int = 1) -> NoReturn:
+    # msg carries ffmpeg stderr and API response bodies, which are full of square
+    # brackets that Rich would otherwise parse as markup tags: at best the text is
+    # silently swallowed, at worst rendering raises.
+    console.print(f"[red]error:[/red] {escape(msg)}")
     raise typer.Exit(code)
 
 
@@ -48,6 +56,17 @@ def transcribe(
     lang_list = [s.strip() for s in langs.split(",") if s.strip()] if langs else []
     settings = load_settings(api_key=api_key, langs=lang_list, max_chunk_s=max_chunk_s, min_chunk_s=min_chunk_s)
 
+    # Bad chunk bounds would only surface after normalizing the whole recording, or
+    # worse, as a wall of 400s from the API. Check them before doing any work.
+    if not 0 < min_chunk_s < max_chunk_s < MAX_CHUNK_LIMIT_S or max_chunk_s < 2 * min_chunk_s:
+        _fail("--max-chunk-s must be < 30 and > --min-chunk-s, and at least 2x --min-chunk-s")
+
+    # An unwritable output path must not be discovered after paying for transcription.
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _fail(f"cannot create output directory {out_path.parent}: {exc}")
+
     try:
         ensure_ffmpeg()
     except FfmpegMissingError as exc:
@@ -58,10 +77,10 @@ def transcribe(
     if estimate_only:
         try:
             duration, chunks = prepare(recording, wd, settings)
-        except FfmpegError as exc:
+        except (FfmpegError, FfmpegMissingError) as exc:
             _fail(str(exc))
         cost = estimate(duration, chunks, settings)
-        console.print(f"{recording.name}: {fmt_ts(duration)} audio, {len(chunks)} chunks")
+        console.print(f"{escape(recording.name)}: {fmt_ts(duration)} audio, {len(chunks)} chunks")
         console.print(f"Projected: STT ₹{duration / 3600 * settings.stt_inr_per_hour:.2f} + MT ~₹{cost.mt_chars / 10_000 * settings.mt_inr_per_10k_chars:.2f} = ~₹{cost.inr_estimate:.2f}")
         raise typer.Exit(0)
 
@@ -72,11 +91,13 @@ def transcribe(
 
     def progress(i: int, n: int, seg: Segment) -> None:
         mark = "" if seg.status == "ok" else f" [yellow]{seg.status}[/yellow]"
-        console.print(f"[{i}/{n}] {fmt_ts(seg.chunk.start_s)} {seg.lang} {seg.prob:.2f}{mark}")
+        # seg.lang is whatever the API reported, so it is escaped like any other
+        # external value; the counter and the mark are ours.
+        console.print(f"\\[{i}/{n}] {fmt_ts(seg.chunk.start_s)} {escape(seg.lang)} {seg.prob:.2f}{mark}")
 
     try:
         transcript = run(recording, wd, settings, SarvamSTT(settings), MayuraTranslator(settings), JsonCache(wd / "cache"), progress)
-    except FfmpegError as exc:
+    except (FfmpegError, FfmpegMissingError) as exc:
         _fail(str(exc))
     except QuotaError as exc:
         _fail(f"{exc}. Cached progress kept; re-run same command to resume.")
@@ -86,11 +107,11 @@ def transcribe(
         _fail(str(exc))
 
     out_path.write_text(render(transcript), encoding="utf-8")
-    console.print(f"Wrote {out_path}")
+    console.print(f"Wrote {escape(str(out_path))}")
     if english_only:
         en_path = out_path.with_suffix(".en.md")
         en_path.write_text(render_english_only(transcript), encoding="utf-8")
-        console.print(f"Wrote {en_path}")
+        console.print(f"Wrote {escape(str(en_path))}")
 
     bad = sum(1 for s in transcript.segments if s.status != "ok")
     console.print(f"{len(transcript.segments)} segments · estimated cost ₹{transcript.cost.inr_estimate:.2f}")
