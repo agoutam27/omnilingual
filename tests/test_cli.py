@@ -112,6 +112,26 @@ def test_missing_ffmpeg_exits_one(rec, patched, monkeypatch):
     assert "brew install ffmpeg" in result.output
 
 
+def test_ffmpeg_error_in_run_exits_one(rec, patched, monkeypatch):
+    from omnilingual.audio.normalize import FfmpegError
+    def boom(*a, **k):
+        raise FfmpegError("ffmpeg failed (exit 1): Invalid data found")
+    monkeypatch.setattr(cli, "run", boom)
+    result = runner.invoke(cli.app, [str(rec), "--api-key", "k"])
+    assert result.exit_code == 1
+    assert "ffmpeg failed" in result.output
+
+
+def test_ffmpeg_error_in_prepare_during_estimate_exits_one(rec, patched, monkeypatch):
+    from omnilingual.audio.normalize import FfmpegError
+    def boom(*a, **k):
+        raise FfmpegError("ffmpeg failed (exit 1): Invalid data found")
+    monkeypatch.setattr(cli, "prepare", boom)
+    result = runner.invoke(cli.app, [str(rec), "--api-key", "k", "--estimate"])
+    assert result.exit_code == 1
+    assert "ffmpeg failed" in result.output
+
+
 def test_missing_input_file_exits_one(tmp_path):
     result = runner.invoke(cli.app, [str(tmp_path / "nope.m4a"), "--api-key", "k"])
     assert result.exit_code != 0

@@ -9,7 +9,7 @@ from typing import Annotated, Optional
 import typer
 from rich.console import Console
 
-from omnilingual.audio.normalize import FfmpegMissingError, ensure_ffmpeg
+from omnilingual.audio.normalize import FfmpegError, FfmpegMissingError, ensure_ffmpeg
 from omnilingual.cache import JsonCache
 from omnilingual.config import ConfigError, load_settings
 from omnilingual.http import AuthError, QuotaError, SarvamError
@@ -21,7 +21,6 @@ from omnilingual.translate.mayura import MayuraTranslator
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
-err = Console(stderr=True)
 
 
 def _fail(msg: str, code: int = 1) -> None:
@@ -57,7 +56,10 @@ def transcribe(
     wd = work_dir_for(recording, work_root)
 
     if estimate_only:
-        duration, chunks = prepare(recording, wd, settings)
+        try:
+            duration, chunks = prepare(recording, wd, settings)
+        except FfmpegError as exc:
+            _fail(str(exc))
         cost = estimate(duration, chunks, settings)
         console.print(f"{recording.name}: {fmt_ts(duration)} audio, {len(chunks)} chunks")
         console.print(f"Projected: STT ₹{duration / 3600 * settings.stt_inr_per_hour:.2f} + MT ~₹{cost.mt_chars / 10_000 * settings.mt_inr_per_10k_chars:.2f} = ~₹{cost.inr_estimate:.2f}")
@@ -74,8 +76,10 @@ def transcribe(
 
     try:
         transcript = run(recording, wd, settings, SarvamSTT(settings), MayuraTranslator(settings), JsonCache(wd / "cache"), progress)
+    except FfmpegError as exc:
+        _fail(str(exc))
     except QuotaError as exc:
-        _fail(f"{exc}. Progress is cached; re-run the same command to resume.")
+        _fail(f"{exc}. Cached progress kept; re-run same command to resume.")
     except AuthError as exc:
         _fail(f"{exc}. Check your Sarvam API key.")
     except SarvamError as exc:
