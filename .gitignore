@@ -1,0 +1,9 @@
+.omc/
+.omnilingual/
+__pycache__/
+.venv/
+*.wav
+*.m4a
+*.mp4
+!tests/fixtures/*.wav
+.env
