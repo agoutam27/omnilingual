@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-SegmentStatus = Literal["ok", "stt_failed", "mt_unsupported", "mt_failed"]
+SegmentStatus = Literal["ok", "no_speech", "stt_failed", "mt_unsupported", "mt_failed"]
 
 
 @dataclass(frozen=True)

@@ -50,3 +50,42 @@ def test_mt_failed_note():
     out = render(t)
     assert "_(translation failed)_" in out
     assert "> " not in out
+
+
+def _no_speech_transcript() -> Transcript:
+    segs = [
+        Segment(_chunk(0), "hi-IN", 0.9, "क", "EN[क]", "ok"),
+        Segment(_chunk(1), "hi-IN", 0.12, "", None, "no_speech"),
+        Segment(_chunk(2), "en-IN", 0.99, "hello", None, "ok"),
+    ]
+    return Transcript(source=Path("/rec/standup.m4a"), duration_s=75.0, segments=segs,
+                      cost=Cost(audio_seconds=75.0, mt_chars=1, inr_estimate=1.0))
+
+
+def test_no_speech_renders_header_note_and_no_text_line():
+    out = render(_no_speech_transcript())
+    assert "**[00:00:25 → 00:00:50] hi-IN** _(no speech detected)_\n\n**[00:00:50" in out
+    assert out.count("> ") == 1  # only the hi-IN ok segment carries a translation
+
+
+def test_no_speech_excluded_from_lang_share():
+    # chunk 1 is 25s of hi-IN-labelled silence; it must not inflate hi-IN's share
+    assert lang_share(_no_speech_transcript().segments) == [("en-IN", 50), ("hi-IN", 50)]
+
+
+def test_lang_share_of_only_no_speech_is_empty():
+    segs = [Segment(_chunk(0), "hi-IN", 0.1, "", None, "no_speech")]
+    assert lang_share(segs) == []
+
+
+def test_english_only_skips_no_speech_segments():
+    out = render_english_only(_no_speech_transcript())
+    assert out == "# Meeting transcript — standup.m4a (English)\n\nEN[क]\n\nhello\n"
+
+
+def test_ok_segment_without_english_has_no_quote_line():
+    t = _no_speech_transcript()
+    t.segments = [Segment(_chunk(0), "hi-IN", 0.9, "क", None, "ok")]
+    out = render(t)
+    assert "क" in out
+    assert "> " not in out

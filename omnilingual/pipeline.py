@@ -182,17 +182,22 @@ def run(
                     "chunk %d: detected %s (p=%.2f) outside configured languages %s",
                     chunk.idx, result.lang, result.prob, ",".join(settings.langs),
                 )
-            seg = Segment(chunk, result.lang, result.prob, result.text, None, "ok")
-            if result.text and result.lang != "en-IN":
-                if not translator.supports(result.lang):
-                    seg.status = "mt_unsupported"
-                else:
-                    english = _mt_cached(result.text, result.lang, translator, cache)
-                    if english is None:
-                        seg.status = "mt_failed"
+            if not result.text.strip():
+                # A successful call that found no speech: silence, music, or crosstalk.
+                # Nothing to translate and nothing to show but the note.
+                seg = Segment(chunk, result.lang, result.prob, "", None, "no_speech")
+            else:
+                seg = Segment(chunk, result.lang, result.prob, result.text, None, "ok")
+                if result.lang != "en-IN":
+                    if not translator.supports(result.lang):
+                        seg.status = "mt_unsupported"
                     else:
-                        seg.english = english
-                        mt_chars += len(result.text)
+                        english = _mt_cached(result.text, result.lang, translator, cache)
+                        if english is None:
+                            seg.status = "mt_failed"
+                        else:
+                            seg.english = english
+                            mt_chars += len(result.text)
         segments.append(seg)
         if progress:
             progress(i, len(chunks), seg)

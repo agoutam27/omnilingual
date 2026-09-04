@@ -288,3 +288,31 @@ def test_prepare_recovers_from_corrupt_manifests(tmp_path: Path, settings, recor
     _, chunks3 = prepare(recording, wd, settings)
     assert chunks3 == chunks
     assert json.loads((wd / "chunking.json").read_text())["max_chunk_s"] == 10.0
+
+
+# --- I5: silent chunks ----------------------------------------------------------
+
+
+@requires_ffmpeg
+def test_empty_transcript_becomes_no_speech_and_skips_translation(tmp_path: Path, settings, recording):
+    wd = tmp_path / "wd"
+    cache = JsonCache(wd / "cache")
+    stt = FakeSTT([
+        STTResult("hi-IN", 0.5, ""),
+        STTResult("hi-IN", 0.5, "   "),
+        STTResult("hi-IN", 0.9, "क"),
+    ])
+    mt = FakeMT()
+    t = run(recording, wd, settings, stt, mt, cache)
+
+    assert [s.status for s in t.segments] == ["no_speech", "no_speech", "ok"]
+    assert t.segments[0].text == "" and t.segments[1].text == ""
+    assert t.segments[0].english is None
+    assert mt.calls == 1  # only the chunk with speech
+    assert t.cost.mt_chars == len("क")
+
+    # an empty transcript is a real API answer, so it is cached like any other
+    stt2 = FakeSTT([])
+    t2 = run(recording, wd, settings, stt2, FakeMT(), cache)
+    assert stt2.calls == 0
+    assert [s.status for s in t2.segments] == ["no_speech", "no_speech", "ok"]

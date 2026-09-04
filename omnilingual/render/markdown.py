@@ -7,6 +7,7 @@ from collections import defaultdict
 from omnilingual.models import Segment, Transcript
 
 _NOTES = {
+    "no_speech": "no speech detected",
     "stt_failed": "transcription failed",
     "mt_unsupported": "translation unavailable: language not supported by translator",
     "mt_failed": "translation failed",
@@ -25,6 +26,9 @@ def lang_share(segments: list[Segment]) -> list[tuple[str, int]]:
         return []
     by_lang: dict[str, float] = defaultdict(float)
     for seg in segments:
+        if seg.status == "no_speech":
+            # The detected language of silence says nothing about who spoke.
+            continue
         by_lang[seg.lang] += seg.chunk.duration_s
     total = sum(by_lang.values()) or 1.0
     ranked = sorted(by_lang.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -48,7 +52,8 @@ def render(t: Transcript) -> str:
         if seg.status != "ok":
             head += f" _({_NOTES[seg.status]})_"
         lines.append(head)
-        lines.append(seg.text)
+        if seg.status != "no_speech":
+            lines.append(seg.text)
         if seg.status == "ok" and seg.english and seg.lang != "en-IN":
             lines.append(f"> {seg.english}")
         lines.append("")
@@ -58,6 +63,8 @@ def render(t: Transcript) -> str:
 def render_english_only(t: Transcript) -> str:
     lines = _header(t, " (English)")
     for seg in t.segments:
+        if seg.status == "no_speech":
+            continue
         if seg.status == "stt_failed":
             lines.append("[transcription failed]")
         elif seg.lang == "en-IN":
