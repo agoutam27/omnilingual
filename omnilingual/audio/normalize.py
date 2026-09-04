@@ -1,0 +1,49 @@
+"""Convert any ffmpeg-readable recording to 16 kHz mono 16-bit PCM WAV."""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+
+class FfmpegMissingError(RuntimeError):
+    pass
+
+
+def ensure_ffmpeg() -> None:
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if missing:
+        raise FfmpegMissingError(
+            f"{', '.join(missing)} not found on PATH. Install with: brew install ffmpeg"
+        )
+
+
+def probe_duration(path: Path) -> float:
+    out = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return float(out)
+
+
+def normalize(src: Path, dst: Path) -> float:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(src),
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+            str(dst),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return probe_duration(dst)
