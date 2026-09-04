@@ -15,8 +15,8 @@ v1 is post-meeting, file-in / file-out, single-user, run on the author's Mac.
 - **Meetings**: 30–90 minutes typical. Three to five known languages per user (e.g. `hi-IN`, `ta-IN`, `te-IN`, `kn-IN`, `en-IN`), with mid-sentence code-mixing.
 - **Speech provider**: Sarvam AI.
   - Speech-to-text: Saaras v4 via `POST /speech-to-text`, `mode="transcribe"`, `language_code="unknown"` for auto-detect. Response includes detected `language_code` and `language_probability`. Synchronous endpoint accepts audio under 30 seconds per call.
-  - Translation: Mayura text translation to `en-IN`. Covers Hindi, Bengali, Tamil, Telugu, Gujarati, Kannada, Malayalam, Marathi, Punjabi, Odia, English.
-  - SDK: `sarvamai` on PyPI.
+  - Translation: `POST /translate`, model `mayura:v1` (default) to `en-IN`. Covers Hindi, Bengali, Tamil, Telugu, Gujarati, Kannada, Malayalam, Marathi, Punjabi, Odia, English. Input limited to 1000 characters per call; `sarvam-translate:v1` (configurable) allows 2000 characters and covers all 22 STT languages. Long chunk text is split at sentence boundaries before translation.
+  - API access: direct REST via `httpx`, not the `sarvamai` SDK, so request shapes are explicit and tests mock HTTP with `respx`.
   - Pricing (Sept 2026): STT ₹30/hour of audio; Mayura ₹20 per 10,000 characters. Free credits are limited (₹100 stated on pricing page; another page says ₹1,000). Budget must be treated as scarce.
 - **Not in v1**: live capture, speaker attribution, Notion export, AI summaries, GUI, Zoom app integration. Notion AI Meeting Notes has no public write API; a future Notion step would create a plain page via `pages.create` / `blocks.append`.
 
@@ -59,9 +59,9 @@ render/markdown.py   → transcript.md
 | `omnilingual/cli.py` | Typer CLI. `omnilingual transcribe <file> [--langs ...] [--out ...] [--estimate] [--english-only]` | `pipeline` |
 | `omnilingual/audio/normalize.py` | Convert any container to 16 kHz mono PCM WAV via `ffmpeg` subprocess. Fail fast if `ffmpeg` missing. | ffmpeg binary |
 | `omnilingual/audio/chunker.py` | Detect silences (ffmpeg `silencedetect`), cut at the last silence before the 28 s mark; fall back to hard cut at 28 s if no silence found; merge fragments shorter than 5 s into neighbour. Write chunk WAVs. | ffmpeg binary |
-| `omnilingual/stt/sarvam.py` | `SarvamSTT.transcribe(wav_path) -> STTResult`. Saaras v4, `mode=transcribe`, `language_code=unknown`. Retry policy from §7. | `sarvamai` |
+| `omnilingual/stt/sarvam.py` | `SarvamSTT.transcribe(wav_path) -> STTResult`. Saaras v4, `mode=transcribe`, `language_code=unknown`. Retry policy from §7. | `httpx`, `http.py` |
 | `omnilingual/translate/base.py` | `Translator` protocol: `to_english(text, src_lang) -> str \| None`; `supports(lang) -> bool`. | — |
-| `omnilingual/translate/mayura.py` | Mayura implementation of `Translator`. | `sarvamai` |
+| `omnilingual/translate/mayura.py` | Mayura implementation of `Translator`. | `httpx`, `http.py` |
 | `omnilingual/cache.py` | JSON file cache. Key = `sha256(chunk wav bytes)` + model id + mode (STT) or `sha256(text)` + src lang + model (MT). | filesystem |
 | `omnilingual/render/markdown.py` | `Transcript -> str`. Pure function. | — |
 | `omnilingual/pipeline.py` | Orchestration, progress reporting, cost tally, resumability. | all above |
@@ -196,7 +196,7 @@ Progress: one line per chunk (`[12/146] 00:05:36 hi-IN 0.97`), final summary wit
 
 ```
 omnilingual/
-  pyproject.toml         # uv / hatch; deps: sarvamai, typer, rich, httpx
+  pyproject.toml         # uv / hatch; deps: httpx, typer, rich; dev: pytest, respx
   README.md
   omnilingual/           # package (modules per §5)
   tests/
