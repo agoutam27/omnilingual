@@ -18,7 +18,11 @@ class JsonCache:
         p = self._path(namespace, key)
         if not p.exists():
             return None
-        return json.loads(p.read_text(encoding="utf-8"))
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A truncated or corrupt entry is worth one more API call, not a crash.
+            return None
 
     def put(self, namespace: str, key: str, value: dict) -> None:
         p = self._path(namespace, key)

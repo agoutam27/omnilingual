@@ -62,13 +62,24 @@ def probe_duration(path: Path) -> float:
 
 
 def normalize(src: Path, dst: Path) -> float:
+    """Write dst atomically: a failed or interrupted ffmpeg must not leave a half-WAV
+    that a later resumed run would mistake for a complete normalization."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    run_tool(
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(src),
-            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
-            str(dst),
-        ],
-    )
+    part = dst.with_name(dst.name + ".part")
+    try:
+        run_tool(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(src),
+                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                # ffmpeg infers the container from the output extension, which is
+                # ".part" here, so state it explicitly.
+                "-f", "wav",
+                str(part),
+            ],
+        )
+    except FfmpegError:
+        part.unlink(missing_ok=True)
+        raise
+    part.replace(dst)
     return probe_duration(dst)

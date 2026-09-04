@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 
 from omnilingual.config import Settings
-from omnilingual.http import send_with_retry
+from omnilingual.http import SarvamError, send_with_retry
 from omnilingual.models import STTResult
 
 
@@ -41,7 +41,10 @@ class SarvamSTT:
             )
 
         resp = send_with_retry(send, sleep=self._sleep)
-        body = resp.json()
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise SarvamError("non-JSON response body", resp.status_code, resp.text[:200]) from exc
         return STTResult(
             lang=body.get("language_code") or "unknown",
             prob=float(body.get("language_probability") or 0.0),

@@ -45,3 +45,38 @@ def test_normalize_raises_on_bad_audio(tmp_path: Path):
     with pytest.raises(FfmpegError) as ei:
         normalize(bad, dst)
     assert "ffmpeg failed" in str(ei.value)
+
+
+@requires_ffmpeg
+def test_normalize_leaves_no_part_file(tmp_path: Path):
+    src = make_wav(tmp_path / "in.wav", [("tone", 1.0)], rate=44100, channels=2)
+    dst = tmp_path / "out" / "normalized.wav"
+    normalize(src, dst)
+    assert dst.exists()
+    assert list(dst.parent.glob("*.part")) == []
+
+
+@requires_ffmpeg
+def test_normalize_cleans_up_part_file_on_failure(tmp_path: Path):
+    bad = tmp_path / "bad.m4a"
+    bad.write_bytes(b"not audio")
+    dst = tmp_path / "out" / "normalized.wav"
+    with pytest.raises(FfmpegError):
+        normalize(bad, dst)
+    assert not dst.exists()
+    assert list(dst.parent.glob("*.part")) == []
+
+
+def test_normalize_never_leaves_a_truncated_destination(tmp_path: Path, monkeypatch):
+    """ffmpeg dying mid-write must not leave a half-WAV that later runs would trust."""
+    dst = tmp_path / "out" / "normalized.wav"
+
+    def half_written_then_fail(cmd: list[str]):
+        Path(cmd[-1]).write_bytes(b"RIFF-truncated")  # ffmpeg's partial output
+        raise FfmpegError("ffmpeg failed (exit 255): killed")
+
+    monkeypatch.setattr("omnilingual.audio.normalize.run_tool", half_written_then_fail)
+    with pytest.raises(FfmpegError):
+        normalize(tmp_path / "in.m4a", dst)
+    assert not dst.exists()
+    assert list(dst.parent.glob("*")) == []

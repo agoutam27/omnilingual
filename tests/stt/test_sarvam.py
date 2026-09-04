@@ -5,7 +5,7 @@ import pytest
 import respx
 
 from omnilingual.config import load_settings
-from omnilingual.http import AuthError
+from omnilingual.http import AuthError, SarvamError
 from omnilingual.stt.sarvam import SarvamSTT
 
 STT_URL = "https://api.sarvam.ai/speech-to-text"
@@ -94,3 +94,15 @@ def test_uses_settings_model_and_base_url(wav):
         )
         SarvamSTT(s, sleep=lambda t: None).transcribe(wav)
         assert b"saaras:v3" in route.calls.last.request.content
+
+
+@respx.mock
+def test_non_json_body_raises_sarvam_error(settings, wav):
+    respx.post(STT_URL).mock(
+        return_value=httpx.Response(200, text="<html>gateway</html>", headers={"content-type": "text/html"})
+    )
+    with pytest.raises(SarvamError) as ei:
+        SarvamSTT(settings, sleep=lambda s: None).transcribe(wav)
+    assert "non-JSON response body" in str(ei.value)
+    assert ei.value.status == 200
+    assert "gateway" in ei.value.body

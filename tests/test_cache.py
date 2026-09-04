@@ -36,3 +36,11 @@ def test_put_overwrites(tmp_path):
     cache.put("stt", "k", {"v": 1})
     cache.put("stt", "k", {"v": 2})
     assert cache.get("stt", "k") == {"v": 2}
+
+
+def test_malformed_json_is_treated_as_miss(tmp_path):
+    cache = JsonCache(tmp_path)
+    p = tmp_path / "stt" / "broken.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json", encoding="utf-8")
+    assert cache.get("stt", "broken") is None

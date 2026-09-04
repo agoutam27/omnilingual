@@ -5,6 +5,7 @@ import pytest
 import respx
 
 from omnilingual.config import load_settings
+from omnilingual.http import SarvamError
 from omnilingual.translate.mayura import (
     MAYURA_LANGS,
     SARVAM_TRANSLATE_LANGS,
@@ -99,3 +100,15 @@ def test_retries_on_5xx(settings):
     route.side_effect = [httpx.Response(502), httpx.Response(200, json={"translated_text": "ok"})]
     assert MayuraTranslator(settings, sleep=lambda s: None).to_english("x", "ta-IN") == "ok"
     assert route.call_count == 2
+
+
+@respx.mock
+def test_non_json_body_raises_sarvam_error(settings):
+    respx.post(MT_URL).mock(
+        return_value=httpx.Response(200, text="<html>gateway</html>", headers={"content-type": "text/html"})
+    )
+    with pytest.raises(SarvamError) as ei:
+        MayuraTranslator(settings, sleep=lambda s: None).to_english("नमस्ते", "hi-IN")
+    assert "non-JSON response body" in str(ei.value)
+    assert ei.value.status == 200
+    assert "gateway" in ei.value.body

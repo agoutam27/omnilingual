@@ -9,7 +9,7 @@ from collections.abc import Callable
 import httpx
 
 from omnilingual.config import Settings
-from omnilingual.http import send_with_retry
+from omnilingual.http import SarvamError, send_with_retry
 
 MAYURA_LANGS: frozenset[str] = frozenset(
     {"bn-IN", "en-IN", "gu-IN", "hi-IN", "kn-IN", "ml-IN", "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN"}
@@ -78,7 +78,11 @@ class MayuraTranslator:
             return self._client.post(url, headers={"api-subscription-key": key}, json=payload)
 
         resp = send_with_retry(send, sleep=self._sleep)
-        return (resp.json().get("translated_text") or "").strip()
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise SarvamError("non-JSON response body", resp.status_code, resp.text[:200]) from exc
+        return (body.get("translated_text") or "").strip()
 
     def to_english(self, text: str, src_lang: str) -> str:
         pieces = split_text(text, self._settings.mt_char_limit)

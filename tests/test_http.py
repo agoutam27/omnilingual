@@ -92,3 +92,18 @@ def test_other_4xx_is_plain_sarvam_error():
         send_with_retry(_sequence(_resp(422, "bad field")), sleep=lambda s: None)
     assert not isinstance(ei.value, (AuthError, QuotaError, TransientError))
     assert ei.value.status == 422
+
+
+def test_transport_error_exhaustion_raises_transient_without_status():
+    req = httpx.Request("POST", "https://x")
+    calls = {"n": 0}
+
+    def send():
+        calls["n"] += 1
+        raise httpx.ConnectError("boom", request=req)
+
+    with pytest.raises(TransientError) as ei:
+        send_with_retry(send, retries=3, sleep=lambda s: None, jitter=lambda: 0.0)
+    assert calls["n"] == 4  # retries + 1 attempts
+    assert ei.value.status is None
+    assert "4 attempts" in str(ei.value)
