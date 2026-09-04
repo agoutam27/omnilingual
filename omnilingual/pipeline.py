@@ -38,7 +38,7 @@ def _chunking_signature(settings: Settings) -> dict[str, float]:
     return {"max_chunk_s": settings.max_chunk_s, "min_chunk_s": settings.min_chunk_s}
 
 
-def _read_json(path: Path):
+def _read_json(path: Path) -> object | None:
     """Parsed JSON, or None when the file is absent or unusable. A corrupt work-dir
     file means "redo the work", never a crash."""
     try:
