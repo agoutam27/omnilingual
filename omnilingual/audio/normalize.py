@@ -11,6 +11,10 @@ class FfmpegMissingError(RuntimeError):
     pass
 
 
+class FfmpegError(RuntimeError):
+    pass
+
+
 def ensure_ffmpeg() -> None:
     missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
     if missing:
@@ -19,31 +23,52 @@ def ensure_ffmpeg() -> None:
         )
 
 
+def run_tool(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run ffmpeg/ffprobe command, surfacing stderr on failure.
+
+    Raises FfmpegMissingError if binary is not found.
+    Raises FfmpegError if command exits non-zero.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise FfmpegMissingError(
+            f"{cmd[0]} not found on PATH. Install with: brew install ffmpeg"
+        ) from e
+
+    if result.returncode != 0:
+        stderr_msg = result.stderr.strip()[-2000:]
+        raise FfmpegError(
+            f"{cmd[0]} failed (exit {result.returncode}): {stderr_msg}"
+        )
+
+    return result
+
+
 def probe_duration(path: Path) -> float:
-    out = subprocess.run(
+    result = run_tool(
         [
             "ffprobe", "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(path),
         ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return float(out)
+    )
+    return float(result.stdout.strip())
 
 
 def normalize(src: Path, dst: Path) -> float:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
+    run_tool(
         [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", str(src),
             "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
             str(dst),
         ],
-        check=True,
-        capture_output=True,
     )
     return probe_duration(dst)

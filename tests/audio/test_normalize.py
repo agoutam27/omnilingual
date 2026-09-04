@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from omnilingual.audio.normalize import FfmpegMissingError, ensure_ffmpeg, normalize, probe_duration
+from omnilingual.audio.normalize import FfmpegError, FfmpegMissingError, ensure_ffmpeg, normalize, probe_duration
 from tests.conftest import make_wav, requires_ffmpeg
 
 
@@ -35,3 +35,13 @@ def test_ensure_ffmpeg_raises_when_missing(monkeypatch):
     with pytest.raises(FfmpegMissingError) as ei:
         ensure_ffmpeg()
     assert "brew install ffmpeg" in str(ei.value)
+
+
+@requires_ffmpeg
+def test_normalize_raises_on_bad_audio(tmp_path: Path):
+    bad = tmp_path / "bad.m4a"
+    bad.write_bytes(b"not audio")
+    dst = tmp_path / "out.wav"
+    with pytest.raises(FfmpegError) as ei:
+        normalize(bad, dst)
+    assert "ffmpeg failed" in str(ei.value)
