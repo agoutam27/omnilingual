@@ -39,6 +39,35 @@ def _header(t: Transcript, suffix: str = "") -> list[str]:
     return [f"# Meeting transcript — {t.source.name}{suffix}", ""]
 
 
+def format_segment(seg: Segment) -> list[str]:
+    """Markdown lines for one segment, shared verbatim by the batch renderer and
+    the live incremental writer. Always ends with the blank separator line."""
+    head = f"**[{fmt_ts(seg.chunk.start_s)} → {fmt_ts(seg.chunk.end_s)}] {seg.lang}**"
+    if seg.status != "ok":
+        head += f" _({_NOTES[seg.status]})_"
+    lines = [head]
+    if seg.status != "no_speech":
+        lines.append(seg.text)
+    if seg.status == "ok" and seg.english and seg.lang != "en-IN":
+        lines.append(f"> {seg.english}")
+    lines.append("")
+    return lines
+
+
+def format_english_line(seg: Segment) -> str | None:
+    """The English-only rendering of one segment, or None when it contributes
+    nothing (silence). Mirrors the batch render_english_only rules exactly."""
+    if seg.status == "no_speech":
+        return None
+    if seg.status == "stt_failed":
+        return "[transcription failed]"
+    if seg.lang == "en-IN":
+        return seg.text
+    if seg.english:
+        return seg.english
+    return f"[{seg.lang}, untranslated]"
+
+
 def render(t: Transcript) -> str:
     lines = _header(t)
     shares = ", ".join(f"{lang} {pct}%" for lang, pct in lang_share(t.segments))
@@ -48,30 +77,16 @@ def render(t: Transcript) -> str:
     lines.append(f"Estimated cost: ₹{t.cost.inr_estimate:.2f}")
     lines += ["", "## Transcript", ""]
     for seg in t.segments:
-        head = f"**[{fmt_ts(seg.chunk.start_s)} → {fmt_ts(seg.chunk.end_s)}] {seg.lang}**"
-        if seg.status != "ok":
-            head += f" _({_NOTES[seg.status]})_"
-        lines.append(head)
-        if seg.status != "no_speech":
-            lines.append(seg.text)
-        if seg.status == "ok" and seg.english and seg.lang != "en-IN":
-            lines.append(f"> {seg.english}")
-        lines.append("")
+        lines += format_segment(seg)
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def render_english_only(t: Transcript) -> str:
     lines = _header(t, " (English)")
     for seg in t.segments:
-        if seg.status == "no_speech":
+        line = format_english_line(seg)
+        if line is None:
             continue
-        if seg.status == "stt_failed":
-            lines.append("[transcription failed]")
-        elif seg.lang == "en-IN":
-            lines.append(seg.text)
-        elif seg.english:
-            lines.append(seg.english)
-        else:
-            lines.append(f"[{seg.lang}, untranslated]")
+        lines.append(line)
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"

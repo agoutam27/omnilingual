@@ -89,3 +89,34 @@ def test_ok_segment_without_english_has_no_quote_line():
     out = render(t)
     assert "क" in out
     assert "> " not in out
+
+
+from omnilingual.render.markdown import format_english_line, format_segment
+
+
+def test_format_segment_ok_with_translation():
+    seg = Segment(_chunk(0), "hi-IN", 0.97, "नमस्ते", "Hello", "ok")
+    assert format_segment(seg) == [
+        "**[00:00:00 → 00:00:25] hi-IN**",
+        "नमस्ते",
+        "> Hello",
+        "",
+    ]
+
+
+def test_format_segment_ok_english_has_no_quote_line():
+    seg = Segment(_chunk(0), "en-IN", 0.99, "hello", None, "ok")
+    assert format_segment(seg) == ["**[00:00:00 → 00:00:25] en-IN**", "hello", ""]
+
+
+def test_format_segment_no_speech_has_note_and_no_text():
+    seg = Segment(_chunk(1), "hi-IN", 0.1, "", None, "no_speech")
+    assert format_segment(seg) == ["**[00:00:25 → 00:00:50] hi-IN** _(no speech detected)_", ""]
+
+
+def test_format_english_line_variants():
+    assert format_english_line(Segment(_chunk(0), "hi-IN", 0.9, "क", "EN[क]", "ok")) == "EN[क]"
+    assert format_english_line(Segment(_chunk(0), "en-IN", 0.9, "hello", None, "ok")) == "hello"
+    assert format_english_line(Segment(_chunk(0), "hi-IN", 0.0, "[transcription failed]", None, "stt_failed")) == "[transcription failed]"
+    assert format_english_line(Segment(_chunk(0), "ta-IN", 0.9, "வ", None, "mt_failed")) == "[ta-IN, untranslated]"
+    assert format_english_line(Segment(_chunk(0), "hi-IN", 0.1, "", None, "no_speech")) is None
