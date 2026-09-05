@@ -67,7 +67,12 @@ class LiveMarkdownWriter:
         )
 
     def append_segment(self, seg: Segment, cost_delta: float = 0.0) -> None:
-        body = ("\n".join(format_segment(seg))).encode("utf-8")
+        # Batch-identical layout: format_segment's trailing "" is the
+        # inter-segment separator, so drop it here and re-add it as the
+        # leading "\n" of every segment after the first.
+        block = format_segment(seg)[:-1]
+        body = ((("\n" if self._segments else "") + "\n".join(block) + "\n")
+                .encode("utf-8"))
         os.write(self._fd, body)  # O_APPEND single write
         self._segments.append(seg)
         self._cost += cost_delta
@@ -106,7 +111,8 @@ class LiveEnglishWriter(LiveMarkdownWriter):
         line = format_english_line(seg)
         if line is None:
             return
-        body = (line + "\n\n").encode("utf-8")
+        body = ((("\n" if self._segments else "") + line + "\n")
+                .encode("utf-8"))
         os.write(self._fd, body)
         self._segments.append(seg)
         self._cost += cost_delta
