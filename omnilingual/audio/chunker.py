@@ -10,8 +10,8 @@ from pathlib import Path
 from omnilingual.audio.normalize import probe_duration, run_tool
 from omnilingual.models import Chunk
 
-_START = re.compile(r"silence_start:\s*([0-9.]+)")
-_END = re.compile(r"silence_end:\s*([0-9.]+)")
+SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
+SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
 
 
 @dataclass(frozen=True)
@@ -40,9 +40,9 @@ def detect_silences(wav: Path, noise_db: float = -35.0, min_dur: float = 0.4) ->
     silences: list[Silence] = []
     start: float | None = None
     for line in proc.stderr.splitlines():
-        if m := _START.search(line):
+        if m := SILENCE_START_RE.search(line):
             start = float(m.group(1))
-        elif (m := _END.search(line)) and start is not None:
+        elif (m := SILENCE_END_RE.search(line)) and start is not None:
             silences.append(Silence(start, float(m.group(1))))
             start = None
     if start is not None:  # silence ran to end of file
