@@ -27,6 +27,8 @@ T = TypeVar("T")
 
 STT_FAILED_TEXT = "[transcription failed]"
 
+LIVE_SESSION_KIND = "omnilingual-live-session"
+
 
 def work_dir_for(source: Path, root: Path) -> Path:
     with source.open("rb") as f:
@@ -159,16 +161,18 @@ def _mt_cached(text: str, lang: str, translator: Translator, cache: JsonCache) -
     )
 
 
-def run(
+def transcribe_chunks(
+    chunks: list[Chunk],
+    duration_s: float,
     source: Path,
-    work_dir: Path,
     settings: Settings,
     stt: STTProvider,
     translator: Translator,
     cache: JsonCache,
     progress: Progress | None = None,
 ) -> Transcript:
-    duration, chunks = prepare(source, work_dir, settings)
+    """The batch STT → translate loop over ready-made chunks. Shared by the file
+    pipeline (run), live-session recovery (run_from_chunks), and nothing else."""
     segments: list[Segment] = []
     mt_chars = 0
 
@@ -202,5 +206,48 @@ def run(
         if progress:
             progress(i, len(chunks), seg)
 
-    cost = Cost(audio_seconds=duration, mt_chars=mt_chars, inr_estimate=_price(duration, mt_chars, settings))
-    return Transcript(source=source, duration_s=duration, segments=segments, cost=cost)
+    cost = Cost(audio_seconds=duration_s, mt_chars=mt_chars, inr_estimate=_price(duration_s, mt_chars, settings))
+    return Transcript(source=source, duration_s=duration_s, segments=segments, cost=cost)
+
+
+def run(
+    source: Path,
+    work_dir: Path,
+    settings: Settings,
+    stt: STTProvider,
+    translator: Translator,
+    cache: JsonCache,
+    progress: Progress | None = None,
+) -> Transcript:
+    duration, chunks = prepare(source, work_dir, settings)
+    return transcribe_chunks(chunks, duration, source, settings, stt, translator, cache, progress)
+
+
+def run_from_chunks(
+    session_dir: Path,
+    settings: Settings,
+    stt: STTProvider,
+    translator: Translator,
+    cache: JsonCache,
+    progress: Progress | None = None,
+) -> Transcript:
+    """Finish a live session's sealed chunks with the batch loop.
+
+    The session's own chunks.json is the manifest and its cache/ dir is the
+    cache namespace, so chunks already transcribed during the live run cost
+    nothing here; only the chunks the live run never billed are paid for.
+    """
+    session = _read_json(session_dir / "session.json")
+    if not isinstance(session, dict) or session.get("kind") != LIVE_SESSION_KIND:
+        raise ValueError(f"not a live session dir (no {LIVE_SESSION_KIND} session.json): {session_dir}")
+    manifest = session_dir / "chunks.json"
+    try:
+        chunks = chunks_from_json(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(f"unusable chunk manifest in {session_dir}: {exc}") from exc
+    if not chunks:
+        raise ValueError(f"live session has no sealed chunks yet: {session_dir}")
+    missing = [c.wav_path for c in chunks if not c.wav_path.exists()]
+    if missing:
+        raise ValueError(f"live session missing {len(missing)} chunk wav(s), e.g. {missing[0]}")
+    return transcribe_chunks(chunks, chunks[-1].end_s, Path(session_dir.name), settings, stt, translator, cache, progress)
