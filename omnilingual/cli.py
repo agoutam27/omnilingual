@@ -217,7 +217,7 @@ def transcribe(
 
 @app.command()
 def live(
-    out: Annotated[Path, typer.Option("--out")],
+    out: Annotated[Optional[Path], typer.Option("--out")] = None,
     input: Annotated[str, typer.Option("--input")] = "Omnilingual",
     mic_only: Annotated[bool, typer.Option("--mic-only")] = False,
     langs: Annotated[str, typer.Option("--langs")] = "",
@@ -270,6 +270,8 @@ def live(
                 "Device (headphones + BlackHole) and confirm the Aggregate "
                 "Device 'Omnilingual' contains mic + BlackHole")
         return
+    if out is None:
+        _fail("Missing option '--out'.")
     out_path = out
     if out_path.exists():
         stamp = datetime.now().strftime("%H%M")

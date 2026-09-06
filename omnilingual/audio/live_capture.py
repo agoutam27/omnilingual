@@ -82,13 +82,13 @@ def downmix_filter(mic_only: bool) -> str:
 def build_command(device_index: int, mic_only: bool, noise_db: float) -> list[str]:
     chain = (
         f"asplit=2[pcm][det];[pcm]{downmix_filter(mic_only)}[out];"
-        f"[det]silencedetect=noise={noise_db}dB:d=0.4"
+        f"[det]silencedetect=noise={noise_db}dB:d=0.4,anullsink"
     )
     return [
         "ffmpeg", "-hide_banner", "-nostdin",
         "-f", "avfoundation", "-thread_queue_size", "8",
         "-i", f":{device_index}",
-        "-af", chain,
+        "-filter_complex", chain,
         "-map", "[out]", "-c:a", "pcm_s16le", "-f", "s16le", "-",
     ]
 

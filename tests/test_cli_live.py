@@ -165,6 +165,49 @@ def test_live_check_audio_probes_without_api(live_cli, monkeypatch):
     assert "dBFS" in res.output
 
 
+def test_live_check_audio_needs_no_out(live_cli, monkeypatch):
+    from omnilingual.audio.live_capture import BYTES_PER_SECOND
+
+    class FakeCap:
+        def __init__(self, *a, **k):
+            pass
+
+        def open(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.close()
+            return False
+
+        def read(self, n):
+            assert n == BYTES_PER_SECOND
+            return b"\x00" * n
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli_mod, "LiveCapture", FakeCap)
+    from omnilingual.audio.live_capture import AudioDevice
+
+    monkeypatch.setattr(cli_mod, "parse_devices",
+                        lambda text: [AudioDevice(index=2, name="Omnilingual")])
+    import subprocess
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stderr": "", "stdout": ""})())
+    res = runner.invoke(app, ["live", "--check-audio"])
+    assert res.exit_code == 0, res.output
+    assert "dBFS" in res.output
+
+
+def test_live_requires_out_without_check_audio(live_cli):
+    res = runner.invoke(app, ["live", "--api-key", "k"])
+    assert res.exit_code == 1
+    assert "--out" in res.output
+
+
 def test_transcribe_from_chunks_recovers_session(live_cli):
     session = _session_dir(live_cli, n=2)
     out = live_cli / "recovered.md"
