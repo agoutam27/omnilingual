@@ -70,12 +70,13 @@ def resolve_device(devices: list[AudioDevice], query: str) -> AudioDevice:
 def downmix_filter(mic_only: bool) -> str:
     """Downmix to 16 kHz mono.
 
-    The Aggregate Device holds mic (1 ch) + BlackHole (2 ch) = 3 channels,
-    mixed with the voice channel dominant. Mic-only mode is already mono.
+    The Aggregate Device holds BlackHole (2 ch) first and the mic (1 ch) last,
+    mixed with the voice channel dominant. Mic-only mode selects the mic
+    channel (c2) so the output is pure mic at full scale.
     A channel-layout mismatch fails fast inside open() with a fix-it hint.
     """
     if mic_only:
-        return "aresample=16000"
+        return "pan=mono|c0=c2,aresample=16000"
     return "pan=mono|c0=0.5*c0+0.25*c1+0.25*c2,aresample=16000"
 
 

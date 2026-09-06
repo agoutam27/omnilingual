@@ -61,7 +61,7 @@ def test_resolve_device_ambiguous_lists_candidates():
 
 
 def test_downmix_filter_shapes():
-    assert downmix_filter(True) == "aresample=16000"
+    assert downmix_filter(True) == "pan=mono|c0=c2,aresample=16000"
     assert (
         downmix_filter(False)
         == "pan=mono|c0=0.5*c0+0.25*c1+0.25*c2,aresample=16000"
