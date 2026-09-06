@@ -3,6 +3,18 @@ from omnilingual.models import chunks_from_json
 from tests.conftest import raw_pcm
 
 
+def test_fractional_gap_start_never_yields_odd_head(tmp_path):
+    """ffmpeg gap timestamps are fractional seconds; int() truncation of the
+    byte length must not produce an odd s16le count (crashed the capture
+    thread in the field: 10.000046875 * 32000 truncates to 320001 bytes)."""
+    session = tmp_path / "s"
+    s = LiveSlicer(session, target_s=8.0, max_s=28.0, min_s=5.0)
+    s.feed(raw_pcm([("tone", 11.0)]))
+    sealed = s.note_gap(10.000046875, 10.8)
+    assert [(c.chunk.start_s, c.chunk.end_s) for c in sealed] == [(0.0, 10.000046875)]
+    assert sealed[0].speech is True
+
+
 def test_seals_at_first_gap_after_target(tmp_path):
     session = tmp_path / "s"
     s = LiveSlicer(session, target_s=8.0, max_s=28.0, min_s=5.0)

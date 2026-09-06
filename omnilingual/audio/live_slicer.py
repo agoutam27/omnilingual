@@ -21,6 +21,13 @@ class SealedChunk:
     speech: bool
 
 
+def _even(n: int) -> int:
+    """Round a byte count down to whole s16le frames. Gap timestamps arrive as
+    fractional seconds, and int() truncation of seconds * 32000 can land on an
+    odd byte — array.frombytes then raises (crashed the capture thread)."""
+    return n & ~1
+
+
 class LiveSlicer:
     """Accumulates PCM, seals speech chunks at silence gaps or the max cut."""
 
@@ -57,7 +64,7 @@ class LiveSlicer:
         if self._skip_until is not None:
             if t1 <= self._skip_until:
                 return []
-            cut = int((self._skip_until - t0) * BYTES_PER_SECOND)
+            cut = _even(int((self._skip_until - t0) * BYTES_PER_SECOND))
             data = data[cut:]
             self._skip_until = None
         self._buf += data
@@ -89,7 +96,7 @@ class LiveSlicer:
                 return out
             sealed = self._seal(start)
             # Discard gap audio: drop through the gap end, keep the tail.
-            drop_through = int((end - self._chunk_start) * BYTES_PER_SECOND)
+            drop_through = _even(int((end - self._chunk_start) * BYTES_PER_SECOND))
             del self._buf[: max(0, drop_through)]
             self._chunk_start = end
             self._gaps = [(a, b) for a, b in self._gaps if b > end]
@@ -103,7 +110,7 @@ class LiveSlicer:
         return min(cands, key=lambda g: g[0])
 
     def _seal(self, end_s: float) -> SealedChunk | None:
-        head_len = int((end_s - self._chunk_start) * BYTES_PER_SECOND)
+        head_len = _even(int((end_s - self._chunk_start) * BYTES_PER_SECOND))
         head = bytes(self._buf[:head_len])
         del self._buf[:head_len]
         start, self._chunk_start = self._chunk_start, end_s
