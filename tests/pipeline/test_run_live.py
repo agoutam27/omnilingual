@@ -266,3 +266,29 @@ def test_quota_halt_keeps_file_valid(respx_mock, tmp_path):
     assert code == 2
     assert any("quota" in m for m in msgs)
     assert "## Transcript" in (tmp_path / "meeting.md").read_text(encoding="utf-8")
+
+
+@respx.mock
+def test_contaminated_probe_still_transcribes_speech(respx_mock, tmp_path):
+    # Regression: speaking during the 1 s ambient probe set the floor at
+    # speech level and gated the whole meeting as silence. The probe now
+    # falls back to the default floor with a warning.
+    _route(respx_mock, langs=("hi-IN", "hi-IN"), texts=("Bravo", "Again"))
+    pcm = raw_pcm([("tone", 21.0), ("silence", 1.0), ("tone", 17.0)])
+    gaps = [
+        (22 * BYTES_PER_SECOND, b"[silencedetect @ x] silence_start: 21.0\n"),
+        (22 * BYTES_PER_SECOND, b"[silencedetect @ x] silence_end: 22.0\n"),
+    ]
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=gaps)
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    msgs = []
+    code = run_live(_opts(tmp_path), settings, SarvamSTT(settings),
+                    MayuraTranslator(settings), status=msgs.append,
+                    capture_factory=factory)
+    assert code == 0
+    assert any("already speaking" in m for m in msgs)
+    text = (tmp_path / "meeting.md").read_text(encoding="utf-8")
+    assert "Bravo" in text

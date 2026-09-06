@@ -21,6 +21,11 @@ class SealedChunk:
     speech: bool
 
 
+#: Fallback speech floor when the ambient probe is unusable (e.g. the user was
+#: already speaking during it). Matches calibrate_energy_floor(0.0).
+DEFAULT_ENERGY_FLOOR = 0.004
+
+
 def _even(n: int) -> int:
     """Round a byte count down to whole s16le frames. Gap timestamps arrive as
     fractional seconds, and int() truncation of seconds * 32000 can land on an
@@ -33,7 +38,7 @@ class LiveSlicer:
 
     def __init__(self, session_dir: Path, *, target_s: float = 8.0,
                  max_s: float = 28.0, min_s: float = 5.0,
-                 energy_floor: float = 0.004) -> None:
+                 energy_floor: float = DEFAULT_ENERGY_FLOOR) -> None:
         if not min_s <= target_s <= max_s:
             raise ValueError("require min_s <= target_s <= max_s")
         self.session_dir = session_dir

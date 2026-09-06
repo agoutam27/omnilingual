@@ -19,7 +19,19 @@ log = logging.getLogger("omnilingual")
 
 def calibrate_energy_floor(ambient_rms: float) -> float:
     """Speech floor from the 1 s ambient probe: 4x ambient, floor 0.004."""
-    return max(ambient_rms * 4.0, 0.004)
+    return max(ambient_rms * 4.0, DEFAULT_ENERGY_FLOOR)
+
+
+def resolve_energy_floor(probe: bytes) -> tuple[float, bool]:
+    """Floor for this run plus whether the probe was voice-contaminated.
+
+    Speaking during the first second would otherwise set the floor at speech
+    level and gate the whole meeting as silence — fall back to the default
+    floor instead so speech is billed rather than missed.
+    """
+    if voice_band_share(probe) >= VOICE_MIN_SHARE:
+        return DEFAULT_ENERGY_FLOOR, True
+    return calibrate_energy_floor(rms(probe)), False
 
 
 def process_chunk(
@@ -88,12 +100,14 @@ from typing import Callable
 
 from omnilingual.audio.live_capture import (
     BYTES_PER_SECOND,
+    VOICE_MIN_SHARE,
     CaptureError,
     LiveCapture,
     parse_silence_line,
     rms,
+    voice_band_share,
 )
-from omnilingual.audio.live_slicer import LiveSlicer
+from omnilingual.audio.live_slicer import DEFAULT_ENERGY_FLOOR, LiveSlicer
 from omnilingual.http import AuthError, QuotaError
 from omnilingual.pipeline import LIVE_SESSION_KIND
 from omnilingual.render.live import LiveEnglishWriter, LiveMarkdownWriter
@@ -152,9 +166,14 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
         return 1
 
     probe = capture.read(BYTES_PER_SECOND)  # 1 s ambient probe, then reused
+    energy_floor, contaminated = resolve_energy_floor(probe)
+    if contaminated:
+        say("[live] warning: you were already speaking during the 1 s ambient "
+            "probe; using the default energy floor. Restart quiet for a "
+            "tighter floor.")
     slicer = LiveSlicer(session, target_s=opts.target_s,
                         max_s=opts.max_chunk_s, min_s=opts.min_chunk_s,
-                        energy_floor=calibrate_energy_floor(rms(probe)))
+                        energy_floor=energy_floor)
 
     title = "Meeting transcript — LIVE " + datetime.now().astimezone().strftime(
         "%Y-%m-%d %H:%M %Z")

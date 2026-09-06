@@ -4,8 +4,8 @@ from omnilingual.cache import JsonCache
 from omnilingual.config import load_settings
 from omnilingual.http import SarvamError, TransientError
 from omnilingual.models import Chunk, STTResult
-from omnilingual.pipeline.live import calibrate_energy_floor, process_chunk
-from tests.conftest import make_wav
+from omnilingual.pipeline.live import calibrate_energy_floor, process_chunk, resolve_energy_floor
+from tests.conftest import make_wav, raw_pcm
 
 
 class FakeSTT:
@@ -113,3 +113,19 @@ def test_silent_chunk_makes_no_api_calls(tmp_path):
 def test_calibrate_energy_floor():
     assert calibrate_energy_floor(0.001) == 0.004
     assert calibrate_energy_floor(0.005) == pytest.approx(0.02)
+
+
+def test_resolve_energy_floor_quiet_probe_calibrates():
+    from omnilingual.audio.live_slicer import DEFAULT_ENERGY_FLOOR
+
+    floor, contaminated = resolve_energy_floor(b"\x00" * 32000)
+    assert contaminated is False
+    assert floor == DEFAULT_ENERGY_FLOOR
+
+
+def test_resolve_energy_floor_voice_probe_falls_back_with_flag():
+    from omnilingual.audio.live_slicer import DEFAULT_ENERGY_FLOOR
+
+    floor, contaminated = resolve_energy_floor(raw_pcm([("tone", 1.0)]))
+    assert contaminated is True
+    assert floor == DEFAULT_ENERGY_FLOOR
