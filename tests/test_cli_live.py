@@ -208,6 +208,63 @@ def test_live_requires_out_without_check_audio(live_cli):
     assert "--out" in res.output
 
 
+def _check_audio_with_probe(live_cli, monkeypatch, probe: bytes):
+    from omnilingual.audio.live_capture import BYTES_PER_SECOND
+
+    assert len(probe) == BYTES_PER_SECOND
+
+    class FakeCap:
+        def __init__(self, *a, **k):
+            pass
+
+        def open(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+        def read(self, n):
+            assert n == BYTES_PER_SECOND
+            return probe
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli_mod, "LiveCapture", FakeCap)
+    from omnilingual.audio.live_capture import AudioDevice
+
+    monkeypatch.setattr(cli_mod, "parse_devices",
+                        lambda text: [AudioDevice(index=2, name="Omnilingual")])
+    import subprocess
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stderr": "", "stdout": ""})())
+    return runner.invoke(app, ["live", "--check-audio"])
+
+
+def test_live_check_audio_voice_verdict(live_cli, monkeypatch):
+    from tests.conftest import raw_pcm
+
+    res = _check_audio_with_probe(live_cli, monkeypatch, raw_pcm([("tone", 1.0)]))
+    assert res.exit_code == 0, res.output
+    assert "VOICE LIKELY" in res.output
+
+
+def test_live_check_audio_hum_verdict(live_cli, monkeypatch):
+    import math
+    import struct
+
+    n = 16000
+    hum = struct.pack(f"<{n}h", *(int(8000 * math.sin(2 * math.pi * 100 * i / 16000))
+                                  for i in range(n)))
+    res = _check_audio_with_probe(live_cli, monkeypatch, hum)
+    assert res.exit_code == 0, res.output
+    assert "NO VOICE" in res.output
+
+
 def test_transcribe_from_chunks_recovers_session(live_cli):
     session = _session_dir(live_cli, n=2)
     out = live_cli / "recovered.md"

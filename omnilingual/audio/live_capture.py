@@ -116,6 +116,29 @@ def dbfs(v: float) -> float:
     return 20 * math.log10(v) if v > 0 else float("-inf")
 
 
+# First-difference energy ratio of a pure tone at f Hz sampled at 16 kHz is
+# about (2*pi*f/16000)^2: ~0.0015 at 100 Hz mains hum, ~0.03 at 440 Hz speech,
+# higher for broadband voice. 0.02 sits between hum harmonics and voice.
+VOICE_MIN_SHARE = 0.02
+
+
+def voice_band_share(samples: bytes) -> float:
+    """Fraction of energy above ~300 Hz, via a first-difference highpass.
+
+    stdlib has no FFT; the first difference attenuates low frequencies
+    quadratically, which is exactly the hum-vs-voice split --check-audio
+    needs. Returns 0.0 for silence. Uses array (audioop is banned)."""
+    if not samples:
+        return 0.0
+    vals = array.array("h")
+    vals.frombytes(samples)
+    sig = sum(v * v for v in vals)
+    if sig == 0:
+        return 0.0
+    diff = sum((b - a) * (b - a) for a, b in zip(vals, vals[1:]))
+    return diff / sig
+
+
 def read_exact(stream, n: int) -> bytes:
     """Read exactly n bytes or raise CaptureError on a truncated stream."""
     chunks: list[bytes] = []

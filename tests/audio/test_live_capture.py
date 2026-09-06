@@ -1,8 +1,11 @@
 import io
+import math
 import struct
 import subprocess
 
 import pytest
+
+from tests.conftest import raw_pcm
 
 from omnilingual.audio.live_capture import (
     AudioDevice,
@@ -17,6 +20,8 @@ from omnilingual.audio.live_capture import (
     read_exact,
     resolve_device,
     rms,
+    voice_band_share,
+    VOICE_MIN_SHARE,
 )
 
 LISTING = """\
@@ -113,3 +118,23 @@ def test_open_raises_when_device_missing(monkeypatch):
 
 def test_close_without_open_is_safe():
     LiveCapture("Omnilingual").close()
+
+
+def _sine(freq: float, seconds: float = 1.0, amp: int = 8000, rate: int = 16000) -> bytes:
+    n = int(seconds * rate)
+    return struct.pack(
+        f"<{n}h",
+        *(int(amp * math.sin(2 * math.pi * freq * i / rate)) for i in range(n)),
+    )
+
+
+def test_voice_band_share_marks_voice_tone():
+    assert voice_band_share(raw_pcm([("tone", 1.0)])) >= VOICE_MIN_SHARE
+
+
+def test_voice_band_share_rejects_mains_hum():
+    assert voice_band_share(_sine(100.0)) < VOICE_MIN_SHARE
+
+
+def test_voice_band_share_silence_is_zero():
+    assert voice_band_share(bytes(32000)) == 0.0

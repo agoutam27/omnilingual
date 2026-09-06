@@ -20,6 +20,8 @@ from omnilingual.audio.live_capture import (
     dbfs,
     parse_devices,
     rms,
+    voice_band_share,
+    VOICE_MIN_SHARE,
 )
 from omnilingual.audio.normalize import FfmpegError, FfmpegMissingError, ensure_ffmpeg
 from omnilingual.cache import JsonCache
@@ -261,14 +263,20 @@ def live(
         try:
             cap.open()
             with cap:
-                level = dbfs(rms(cap.read(BYTES_PER_SECOND)))
+                probe = cap.read(BYTES_PER_SECOND)
         except CaptureError as exc:
             _fail(str(exc))
+        level = dbfs(rms(probe))
         say(f"input '{input}': 1 s probe {level:.1f} dBFS")
         if level < -50:
             say("near silence: set the system output to the Multi-Output "
                 "Device (headphones + BlackHole) and confirm the Aggregate "
                 "Device 'Omnilingual' contains mic + BlackHole")
+        elif voice_band_share(probe) >= VOICE_MIN_SHARE:
+            say("voice-band check: VOICE LIKELY — the mic is delivering speech frequencies")
+        else:
+            say("voice-band check: NO VOICE — only low-frequency energy "
+                "(mains hum?); check the Aggregate mic selection, gain, and mute")
         return
     if out is None:
         _fail("Missing option '--out'.")
