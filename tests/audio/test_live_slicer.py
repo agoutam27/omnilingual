@@ -1,3 +1,5 @@
+import pytest
+
 from omnilingual.audio.live_slicer import LiveSlicer
 from omnilingual.models import chunks_from_json
 from tests.conftest import raw_pcm
@@ -37,15 +39,88 @@ def test_ignores_gap_before_target(tmp_path):
     assert [(c.chunk.start_s, c.chunk.end_s) for c in sealed] == [(0.0, 10.0)]
 
 
-def test_gap_audio_discarded_from_next_chunk(tmp_path):
+def test_gap_preroll_capped_at_preroll_s(tmp_path):
+    """A 1 s gap keeps only its final preroll_s (0.75 s) as the next chunk's
+    pre-roll; the excess 0.25 s (8000 bytes) is dropped byte-exactly, so the
+    next chunk starts at 11.0 - 0.75 = 10.25."""
     session = tmp_path / "s"
     s = LiveSlicer(session, target_s=8.0, max_s=28.0, min_s=5.0)
     s.feed(raw_pcm([("tone", 10.0)]))
+    s.feed(raw_pcm([("silence", 1.0)]))  # gap audio streams through the buffer
     s.note_gap(10.0, 11.0)
     sealed = s.feed(raw_pcm([("tone", 8.0)]))
     assert sealed == []
+    s.feed(raw_pcm([("silence", 0.5)]))
+    sealed = s.note_gap(19.0, 19.5)
+    assert [(c.chunk.start_s, c.chunk.end_s) for c in sealed] == [(10.25, 19.0)]
+
+
+def test_short_gap_kept_entirely_next_chunk_contiguous(tmp_path):
+    """A gap shorter than preroll_s is kept whole: the next chunk starts
+    exactly where the previous one ended, so no audio is lost or doubled."""
+    session = tmp_path / "s"
+    s = LiveSlicer(session, target_s=8.0, max_s=28.0, min_s=5.0)
+    s.feed(raw_pcm([("tone", 10.0)]))
+    s.feed(raw_pcm([("silence", 0.6)]))
+    assert [(c.chunk.start_s, c.chunk.end_s) for c in s.note_gap(10.0, 10.6)] == [(0.0, 10.0)]
+    s.feed(raw_pcm([("tone", 8.4)]))  # 10.6 -> 19.0
+    s.feed(raw_pcm([("silence", 0.5)]))  # 19.0 -> 19.5
+    sealed = s.note_gap(19.0, 19.5)
+    assert [(c.chunk.start_s, c.chunk.end_s) for c in sealed] == [(10.0, 19.0)]
+
+
+def test_long_gap_preroll_starts_at_gap_end_minus_preroll(tmp_path):
+    """A 5 s silence keeps only its final 0.75 s: the next chunk starts at
+    gap_end - preroll_s (15.0 - 0.75 = 14.25, an exact 136000-byte drop), so
+    rms speech gating is not diluted by minutes of silence."""
+    session = tmp_path / "s"
+    s = LiveSlicer(session, target_s=8.0, max_s=28.0, min_s=5.0)
+    s.feed(raw_pcm([("tone", 10.0)]))
+    s.feed(raw_pcm([("silence", 5.0)]))
+    assert [(c.chunk.start_s, c.chunk.end_s) for c in s.note_gap(10.0, 15.0)] == [(0.0, 10.0)]
+    s.feed(raw_pcm([("tone", 8.0)]))  # 15.0 -> 23.0
+    s.feed(raw_pcm([("silence", 0.5)]))  # 23.0 -> 23.5
+    sealed = s.note_gap(23.0, 23.5)
+    assert [(c.chunk.start_s, c.chunk.end_s) for c in sealed] == [(14.25, 23.0)]
+    manifest = chunks_from_json((session / "chunks.json").read_text())
+    assert [(c.idx, c.start_s, c.end_s) for c in manifest] == [(0, 0.0, 10.0), (1, 14.25, 23.0)]
+
+
+def test_zero_preroll_restores_full_gap_drop(tmp_path):
+    """preroll_s=0 keeps none of the gap: the old full-drop behavior."""
+    session = tmp_path / "s"
+    s = LiveSlicer(session, target_s=8.0, max_s=28.0, min_s=5.0, preroll_s=0.0)
+    s.feed(raw_pcm([("tone", 10.0)]))
+    s.feed(raw_pcm([("silence", 1.0)]))
+    s.note_gap(10.0, 11.0)
+    sealed = s.feed(raw_pcm([("tone", 8.0)]))
+    assert sealed == []
+    s.feed(raw_pcm([("silence", 0.5)]))
     sealed = s.note_gap(19.0, 19.5)
     assert [(c.chunk.start_s, c.chunk.end_s) for c in sealed] == [(11.0, 19.0)]
+
+
+def test_stale_gap_pruned_after_preroll_seal(tmp_path):
+    """The processed gap must not linger over the kept pre-roll region (the
+    new chunk start sits inside the old gap), and a stale gap inside the
+    pre-roll must never re-seal; the next real gap seals with exact bounds."""
+    session = tmp_path / "s"
+    s = LiveSlicer(session, target_s=8.0, max_s=28.0, min_s=5.0)
+    s.feed(raw_pcm([("tone", 10.0)]))
+    s.feed(raw_pcm([("silence", 0.8)]))
+    assert [(c.chunk.start_s, c.chunk.end_s) for c in s.note_gap(10.0, 10.8)] == [(0.0, 10.0)]
+    assert s._gaps == []  # processed gap pruned although the new start (10.05) is inside it
+    s.note_gap(10.2, 10.5)  # stale: entirely inside the kept pre-roll region
+    s.feed(raw_pcm([("tone", 8.2)]))  # 10.8 -> 19.0
+    assert s.feed(raw_pcm([("silence", 0.5)])) == []  # 19.0 -> 19.5; stale gap never seals
+    sealed = s.note_gap(19.0, 19.5)
+    assert [(c.chunk.start_s, c.chunk.end_s) for c in sealed] == [(10.05, 19.0)]
+    assert s._gaps == []
+
+
+def test_rejects_negative_preroll(tmp_path):
+    with pytest.raises(ValueError, match="preroll_s"):
+        LiveSlicer(tmp_path / "s", preroll_s=-0.1)
 
 
 def test_hard_cut_at_max_without_silence(tmp_path):

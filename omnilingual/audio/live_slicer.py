@@ -38,14 +38,18 @@ class LiveSlicer:
 
     def __init__(self, session_dir: Path, *, target_s: float = 8.0,
                  max_s: float = 28.0, min_s: float = 5.0,
-                 energy_floor: float = DEFAULT_ENERGY_FLOOR) -> None:
+                 energy_floor: float = DEFAULT_ENERGY_FLOOR,
+                 preroll_s: float = 0.75) -> None:
         if not min_s <= target_s <= max_s:
             raise ValueError("require min_s <= target_s <= max_s")
+        if preroll_s < 0:
+            raise ValueError("require preroll_s >= 0")
         self.session_dir = session_dir
         self.target = target_s
         self.max_s = max_s
         self.min_s = min_s
         self.energy_floor = energy_floor
+        self.preroll_s = preroll_s
         self.manifest_path = session_dir / "chunks.json"
         self._wav_dir = session_dir / "live-chunks"
         self._wav_dir.mkdir(parents=True, exist_ok=True)
@@ -100,10 +104,15 @@ class LiveSlicer:
             if start > self._chunk_start + buffered:
                 return out
             sealed = self._seal(start)
-            # Discard gap audio: drop through the gap end, keep the tail.
-            drop_through = _even(int((end - self._chunk_start) * BYTES_PER_SECOND))
-            del self._buf[: max(0, drop_through)]
-            self._chunk_start = end
+            # Keep a capped pre-roll of the gap's tail as the start of the next
+            # chunk: quiet speech fading into a detected gap must survive. Only
+            # the excess beyond preroll_s is dropped, and the new chunk start is
+            # derived from the bytes actually deleted so buffer and byte clock
+            # never drift.
+            keep = min(end - start, self.preroll_s)
+            drop_bytes = _even(int(((end - keep) - start) * BYTES_PER_SECOND))
+            del self._buf[: max(0, drop_bytes)]
+            self._chunk_start = start + drop_bytes / BYTES_PER_SECOND
             self._gaps = [(a, b) for a, b in self._gaps if b > end]
             if sealed is not None:
                 out.append(sealed)
