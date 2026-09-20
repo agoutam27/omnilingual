@@ -84,18 +84,23 @@ def prepare(source: Path, work_dir: Path, settings: Settings) -> tuple[float, li
     return duration, chunks
 
 
-def _price(audio_seconds: float, mt_chars: int, settings: Settings) -> float:
-    stt = audio_seconds / 3600.0 * settings.stt_inr_per_hour
+def _price(audio_seconds: float, mt_chars: int, settings: Settings, stt: STTProvider | None = None) -> float:
+    rate = getattr(stt, "inr_per_hour", None)
+    stt_cost = audio_seconds / 3600.0 * (rate if rate is not None else settings.stt_inr_per_hour)
     mt = mt_chars / 10_000.0 * settings.mt_inr_per_10k_chars
-    return round(stt + mt, 4)
+    return round(stt_cost + mt, 4)
 
 
 def estimate(
-    duration_s: float, chunks: list[Chunk], settings: Settings, chars_per_second: float = 15.0
+    duration_s: float,
+    chunks: list[Chunk],
+    settings: Settings,
+    chars_per_second: float = 15.0,
+    stt: STTProvider | None = None,
 ) -> Cost:
     audio_seconds = sum(c.duration_s for c in chunks) or duration_s
     mt_chars = int(audio_seconds * chars_per_second)
-    return Cost(audio_seconds=audio_seconds, mt_chars=mt_chars, inr_estimate=_price(audio_seconds, mt_chars, settings))
+    return Cost(audio_seconds=audio_seconds, mt_chars=mt_chars, inr_estimate=_price(audio_seconds, mt_chars, settings, stt))
 
 
 def _cached_call(
@@ -206,7 +211,7 @@ def transcribe_chunks(
         if progress:
             progress(i, len(chunks), seg)
 
-    cost = Cost(audio_seconds=duration_s, mt_chars=mt_chars, inr_estimate=_price(duration_s, mt_chars, settings))
+    cost = Cost(audio_seconds=duration_s, mt_chars=mt_chars, inr_estimate=_price(duration_s, mt_chars, settings, stt))
     return Transcript(source=source, duration_s=duration_s, segments=segments, cost=cost)
 
 
