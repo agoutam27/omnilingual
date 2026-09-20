@@ -30,6 +30,8 @@ class Settings:
     stt_provider: str = "sarvam"
     stt_model: str | None = None
     groq_api_key: str | None = None
+    diarizer: str | None = None
+    num_speakers: int | None = None
     mt_model: str = "mayura:v1"
     mt_mode: str = "formal"
     max_chunk_s: float = 28.0
@@ -80,4 +82,8 @@ def load_settings(
         overrides["langs"] = tuple(overrides["langs"])
     settings = replace(settings, **overrides)
     settings.resolved_stt_model  # validate stt_provider early, before any paid work
+    if settings.num_speakers is not None and settings.num_speakers < 2:
+        raise ConfigError(
+            f"num_speakers must be at least 2, got {settings.num_speakers}"
+        )
     return settings

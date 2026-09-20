@@ -34,6 +34,18 @@ def test_unknown_stt_provider_rejected_at_load():
         load_settings(env={}, stt_provider="bogus")
 
 
+def test_diarizer_defaults_off():
+    s = load_settings(env={})
+    assert s.diarizer is None
+    assert s.num_speakers is None
+
+
+def test_num_speakers_needs_at_least_two():
+    with pytest.raises(ConfigError, match="num_speakers"):
+        load_settings(env={}, num_speakers=1)
+    assert load_settings(env={}, num_speakers=3).num_speakers == 3
+
+
 def test_explicit_key_beats_env():
     s = load_settings(api_key="explicit", env={"SARVAM_API_KEY": "fromenv"})
     assert s.api_key == "explicit"

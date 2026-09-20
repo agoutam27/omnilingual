@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
+import wave
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
@@ -14,6 +16,8 @@ from omnilingual.audio.chunker import chunk_audio
 from omnilingual.audio.normalize import normalize, probe_duration
 from omnilingual.cache import JsonCache, mt_key, stt_key
 from omnilingual.config import Settings
+from omnilingual.diarize.assign import assign_speakers
+from omnilingual.diarize.base import Diarizer, Turn
 from omnilingual.http import AuthError, QuotaError, SarvamError, TransientError
 from omnilingual.models import Chunk, Cost, Segment, STTResult, Transcript, chunks_from_json, chunks_to_json
 from omnilingual.stt.base import STTProvider
@@ -166,6 +170,48 @@ def _mt_cached(text: str, lang: str, translator: Translator, cache: JsonCache) -
     )
 
 
+def _diarize_slug(model: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", model)
+
+
+def _diarize_cached(
+    wav_path: Path, diarizer: Diarizer, cache: JsonCache, num_speakers: int | None
+) -> list[Turn]:
+    """Diarize once per audio file. The work dir is already content-addressed
+    by the recording, so the key only needs the model and speaker count."""
+    key = f"diarize-{_diarize_slug(diarizer.model)}-ns{num_speakers or 'auto'}"
+    return _cached_call(
+        cache,
+        "diarize",
+        key,
+        call=lambda: diarizer.diarize(wav_path),
+        decode=lambda hit: [Turn(**d) for d in hit["turns"]],
+        encode=lambda turns: {
+            "turns": [
+                {"start_s": t.start_s, "end_s": t.end_s, "speaker": t.speaker}
+                for t in turns
+            ]
+        },
+        describe=f"{wav_path.name} diarization",
+    ) or []
+
+
+def _combine_session_wavs(session_dir: Path, chunks: list[Chunk]) -> Path:
+    """Concatenate sealed live chunks (all 16 kHz mono s16le) into one audio
+    file so the offline diarizer sees the whole session contiguously."""
+    out = session_dir / "diarize-input.wav"
+    with wave.open(str(out), "wb") as wout:
+        wout.setnchannels(1)
+        wout.setsampwidth(2)
+        wout.setframerate(16000)
+        for chunk in chunks:
+            with wave.open(str(chunk.wav_path), "rb") as win:
+                if (win.getnchannels(), win.getsampwidth(), win.getframerate()) != (1, 2, 16000):
+                    raise ValueError(f"chunk wav has unexpected format: {chunk.wav_path}")
+                wout.writeframes(win.readframes(win.getnframes()))
+    return out
+
+
 def transcribe_chunks(
     chunks: list[Chunk],
     duration_s: float,
@@ -175,6 +221,7 @@ def transcribe_chunks(
     translator: Translator,
     cache: JsonCache,
     progress: Progress | None = None,
+    speakers: dict[int, str | None] | None = None,
 ) -> Transcript:
     """The batch STT → translate loop over ready-made chunks. Shared by the file
     pipeline (run), live-session recovery (run_from_chunks), and nothing else."""
@@ -194,9 +241,12 @@ def transcribe_chunks(
             if not result.text.strip():
                 # A successful call that found no speech: silence, music, or crosstalk.
                 # Nothing to translate and nothing to show but the note.
+                # Silence belongs to nobody, so it never carries a speaker label.
                 seg = Segment(chunk, result.lang, result.prob, "", None, "no_speech")
             else:
                 seg = Segment(chunk, result.lang, result.prob, result.text, None, "ok")
+                if speakers is not None:
+                    seg.speaker = speakers.get(chunk.idx)
                 if result.lang != "en-IN":
                     if not translator.supports(result.lang):
                         seg.status = "mt_unsupported"
@@ -215,6 +265,20 @@ def transcribe_chunks(
     return Transcript(source=source, duration_s=duration_s, segments=segments, cost=cost)
 
 
+def _speakers_for_chunks(
+    chunks: list[Chunk],
+    audio: Path,
+    settings: Settings,
+    diarizer: Diarizer | None,
+    cache: JsonCache,
+) -> dict[int, str | None] | None:
+    """Diarize one audio file and map the turns onto chunks. None when off."""
+    if diarizer is None:
+        return None
+    turns = _diarize_cached(audio, diarizer, cache, settings.num_speakers)
+    return assign_speakers(chunks, turns)
+
+
 def run(
     source: Path,
     work_dir: Path,
@@ -223,9 +287,11 @@ def run(
     translator: Translator,
     cache: JsonCache,
     progress: Progress | None = None,
+    diarizer: Diarizer | None = None,
 ) -> Transcript:
     duration, chunks = prepare(source, work_dir, settings)
-    return transcribe_chunks(chunks, duration, source, settings, stt, translator, cache, progress)
+    speakers = _speakers_for_chunks(chunks, work_dir / "normalized.wav", settings, diarizer, cache)
+    return transcribe_chunks(chunks, duration, source, settings, stt, translator, cache, progress, speakers=speakers)
 
 
 def run_from_chunks(
@@ -235,6 +301,7 @@ def run_from_chunks(
     translator: Translator,
     cache: JsonCache,
     progress: Progress | None = None,
+    diarizer: Diarizer | None = None,
 ) -> Transcript:
     """Finish a live session's sealed chunks with the batch loop.
 
@@ -255,4 +322,8 @@ def run_from_chunks(
     missing = [c.wav_path for c in chunks if not c.wav_path.exists()]
     if missing:
         raise ValueError(f"live session missing {len(missing)} chunk wav(s), e.g. {missing[0]}")
-    return transcribe_chunks(chunks, chunks[-1].end_s, Path(session_dir.name), settings, stt, translator, cache, progress)
+    speakers = None
+    if diarizer is not None:
+        combined = _combine_session_wavs(session_dir, chunks)
+        speakers = _speakers_for_chunks(chunks, combined, settings, diarizer, cache)
+    return transcribe_chunks(chunks, chunks[-1].end_s, Path(session_dir.name), settings, stt, translator, cache, progress, speakers=speakers)

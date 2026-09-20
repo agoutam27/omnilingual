@@ -6,9 +6,18 @@ import pytest
 
 from omnilingual.cache import JsonCache
 from omnilingual.config import load_settings
+from omnilingual.diarize.base import Turn
 from omnilingual.http import QuotaError, SarvamError, TransientError
-from omnilingual.models import STTResult, chunks_from_json
-from omnilingual.pipeline import estimate, prepare, run, work_dir_for
+from omnilingual.models import Chunk, STTResult, chunks_from_json, chunks_to_json
+from omnilingual.pipeline import (
+    LIVE_SESSION_KIND,
+    estimate,
+    prepare,
+    run,
+    run_from_chunks,
+    transcribe_chunks,
+    work_dir_for,
+)
 from tests.conftest import make_wav, requires_ffmpeg
 
 
@@ -316,3 +325,102 @@ def test_empty_transcript_becomes_no_speech_and_skips_translation(tmp_path: Path
     t2 = run(recording, wd, settings, stt2, FakeMT(), cache)
     assert stt2.calls == 0
     assert [s.status for s in t2.segments] == ["no_speech", "no_speech", "ok"]
+
+
+# --- Speaker diarization (Task 4) ------------------------------------------------
+
+
+class FakeDiarizer:
+    model = "fake-diarize"
+
+    def __init__(self, turns):
+        self._turns = list(turns)
+        self.calls = 0
+        self.paths: list[Path] = []
+
+    def diarize(self, wav_path: Path):
+        self.calls += 1
+        self.paths.append(wav_path)
+        return list(self._turns)
+
+
+def test_transcribe_chunks_applies_speaker_map(tmp_path: Path, settings):
+    w1 = tmp_path / "a.wav"; w1.write_bytes(b"a")
+    w2 = tmp_path / "b.wav"; w2.write_bytes(b"b")
+    chunks = [Chunk(0, 0.0, 10.0, w1), Chunk(1, 10.0, 20.0, w2)]
+    stt = FakeSTT([STTResult("hi-IN", 0.9, "एक"), STTResult("hi-IN", 0.9, "दो")])
+    t = transcribe_chunks(
+        chunks, 20.0, Path("m.m4a"), settings, stt, FakeMT(),
+        JsonCache(tmp_path / "cache"),
+        speakers={0: "Speaker 1", 1: "Speaker 2"},
+    )
+    assert [s.speaker for s in t.segments] == ["Speaker 1", "Speaker 2"]
+
+
+def test_transcribe_chunks_skips_speaker_on_silence(tmp_path: Path, settings):
+    w1 = tmp_path / "a.wav"; w1.write_bytes(b"a")
+    chunks = [Chunk(0, 0.0, 10.0, w1)]
+    stt = FakeSTT([STTResult("hi-IN", 0.5, "   ")])
+    t = transcribe_chunks(
+        chunks, 10.0, Path("m.m4a"), settings, stt, FakeMT(),
+        JsonCache(tmp_path / "cache"),
+        speakers={0: "Speaker 1"},
+    )
+    assert t.segments[0].status == "no_speech"
+    assert t.segments[0].speaker is None
+
+
+@requires_ffmpeg
+def test_run_diarizes_once_and_caches(tmp_path: Path, settings, recording):
+    wd = tmp_path / "wd"
+    dz1 = FakeDiarizer([Turn(0.0, 25.0, "0")])
+    results = [
+        STTResult("hi-IN", 0.95, "नमस्ते"),
+        STTResult("en-IN", 0.99, "hello"),
+        STTResult("hi-IN", 0.90, "क"),
+    ]
+    t = run(recording, wd, settings, FakeSTT(results), FakeMT(),
+            JsonCache(wd / "cache"), diarizer=dz1)
+    assert dz1.calls == 1
+    assert all(s.speaker == "Speaker 1" for s in t.segments if s.status != "no_speech")
+
+    dz2 = FakeDiarizer([Turn(0.0, 25.0, "9")])
+    t2 = run(
+        recording, wd, settings,
+        FakeSTT([STTResult("hi-IN", 0.95, "न"), STTResult("en-IN", 0.99, "h"), STTResult("hi-IN", 0.9, "क")]),
+        FakeMT(), JsonCache(wd / "cache"), diarizer=dz2,
+    )
+    assert dz2.calls == 0  # cached turns reused despite a different engine
+    assert all(s.speaker == "Speaker 1" for s in t2.segments if s.status != "no_speech")
+
+
+@requires_ffmpeg
+def test_diarize_cache_key_includes_num_speakers(tmp_path: Path, settings, recording):
+    wd = tmp_path / "wd"
+    dz = FakeDiarizer([Turn(0.0, 25.0, "0")])
+    results = lambda: [STTResult("hi-IN", 0.95, "न"), STTResult("en-IN", 0.99, "h"), STTResult("hi-IN", 0.9, "क")]
+    run(recording, wd, settings, FakeSTT(results()), FakeMT(), JsonCache(wd / "cache"), diarizer=dz)
+    s3 = load_settings(api_key="k", env={}, max_chunk_s=10.0, min_chunk_s=2.0, num_speakers=3)
+    run(recording, wd, s3, FakeSTT(results()), FakeMT(), JsonCache(wd / "cache"), diarizer=dz)
+    assert dz.calls == 2
+
+
+def test_run_from_chunks_diarizes_combined_audio(tmp_path: Path, settings):
+    session = tmp_path / "live-1"
+    (session / "live-chunks").mkdir(parents=True)
+    w0 = session / "live-chunks" / "0000.wav"
+    w1 = session / "live-chunks" / "0001.wav"
+    make_wav(w0, [("tone", 5.0)])
+    make_wav(w1, [("tone", 5.0)])
+    chunks = [Chunk(0, 0.0, 5.0, w0.resolve()), Chunk(1, 5.0, 10.0, w1.resolve())]
+    (session / "chunks.json").write_text(chunks_to_json(chunks), encoding="utf-8")
+    (session / "session.json").write_text(json.dumps({"kind": LIVE_SESSION_KIND}), encoding="utf-8")
+    dz = FakeDiarizer([Turn(0.0, 10.0, "5")])
+    t = run_from_chunks(
+        session, settings,
+        FakeSTT([STTResult("hi-IN", 0.9, "एक"), STTResult("hi-IN", 0.9, "दो")]),
+        FakeMT(), JsonCache(session / "cache"), diarizer=dz,
+    )
+    assert dz.calls == 1
+    assert dz.paths[0].name == "diarize-input.wav"
+    assert [s.speaker for s in t.segments] == ["Speaker 1", "Speaker 1"]

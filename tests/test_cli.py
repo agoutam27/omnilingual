@@ -34,9 +34,10 @@ def patched(monkeypatch, rec):
     monkeypatch.setattr(cli, "MayuraTranslator", lambda settings: object())
     calls = {}
 
-    def fake_run(source, wd, settings, stt, translator, cache, progress=None):
+    def fake_run(source, wd, settings, stt, translator, cache, progress=None, diarizer=None):
         calls["settings"] = settings
         calls["wd"] = wd
+        calls["diarizer"] = diarizer
         t = _transcript(source, calls.get("statuses", ("ok",)))
         if progress:
             for i, seg in enumerate(t.segments, 1):
@@ -255,3 +256,29 @@ def test_progress_line_renders_literal_counter_brackets(rec, patched):
     assert "[1/2] 00:00:00 hi-IN 0.90" in result.output
     assert "[2/2] 00:00:10 hi-IN 0.90 mt_failed" in result.output
     assert "\\[" not in result.output
+
+
+# --- Speaker diarization flags -------------------------------------------------
+
+
+def test_diarize_without_extra_exits_one(rec, patched):
+    result = runner.invoke(cli.app, [str(rec), "--api-key", "k", "--diarize"])
+    assert result.exit_code == 1
+    assert "diarize" in result.output
+
+
+def test_diarize_wires_provider_and_speakers(rec, patched, monkeypatch):
+    monkeypatch.setattr(cli, "build_diarizer", lambda settings: object())
+    result = runner.invoke(
+        cli.app, [str(rec), "--api-key", "k", "--diarize", "--speakers", "3"])
+    assert result.exit_code == 0, result.output
+    assert patched["settings"].diarizer == "sherpa"
+    assert patched["settings"].num_speakers == 3
+    assert patched["diarizer"] is not None
+
+
+def test_no_diarize_flag_means_no_diarizer(rec, patched):
+    result = runner.invoke(cli.app, [str(rec), "--api-key", "k"])
+    assert result.exit_code == 0, result.output
+    assert patched["settings"].diarizer is None
+    assert patched["diarizer"] is None
