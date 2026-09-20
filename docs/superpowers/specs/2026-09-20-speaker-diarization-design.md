@@ -1,7 +1,7 @@
 # Speaker Diarization — Research & Integration Design
 
 Date: 2026-09-20
-Status: Research complete, design proposed — not yet implemented
+Status: Tasks 1–6 implemented on `feat/speaker-diarization` (plan `2026-09-20-speaker-diarization.md`); Phase 4 eval gate still open
 Audience: omnilingual maintainers
 Builds on: `2026-09-19-stt-provider-alternatives-design.md`
 

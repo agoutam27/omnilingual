@@ -108,6 +108,34 @@ uv run scripts/eval_stt.py .omnilingual/<hash>/chunks/0007.wav
 Translation to English always goes through Sarvam Mayura, so `SARVAM_API_KEY`
 is required regardless of provider.
 
+## Speaker diarization
+
+Add `--diarize` to label every transcript segment with its speaker —
+`Speaker 1`, `Speaker 2`, … in first-appearance order:
+
+```bash
+uv sync --extra diarize            # sherpa-onnx + soundfile; no API key needed
+uv run omnilingual meeting.m4a --diarize
+uv run omnilingual meeting.m4a --diarize --speakers 3   # when headcount is known
+uv run omnilingual live --out live.md --diarize --stt-workers 1
+```
+
+Diarization runs fully on-device via sherpa-onnx: the recording is diarized
+once and the speaker turns are cached in the work dir, so re-runs are free.
+The same embedding models also back live mode, where each sealed chunk is
+matched against running speaker centroids (best-effort labels while recording;
+`--from-chunks` recovery re-diarizes the saved session for authoritative
+labels). Segment headers render `**[00:01:23 → 00:01:31] Speaker 2 · hi-IN**`,
+the English-only file prefixes `Speaker 2: `, and the transcript header gains
+a per-speaker share line. Labels are anonymous — no cross-recording
+voiceprints, no names.
+
+Caveats: a chunk containing two voices is attributed to its dominant speaker;
+overlapped speech is not separated. The models first download (~40 MB) to
+`~/.cache/omnilingual/models/`. Accuracy on Indian-accented speech is still
+under evaluation — spot-check with `uv run scripts/eval_diarize.py meeting.m4a`
+before trusting labels on an important meeting.
+
 ## Development
 
 ```bash
@@ -115,6 +143,7 @@ uv run pytest -q                              # unit + integration (mocked HTTP)
 SARVAM_API_KEY=... uv run pytest --run-live   # two real Sarvam API calls, costs a few paise
 uv run pytest --run-mlx                       # real local Whisper via MLX (Apple Silicon)
 uv run pytest --run-faster-whisper            # real local Whisper on CPU (downloads ~500 MB)
+uv run pytest --run-diarize                   # real sherpa-onnx diarization (downloads ~40 MB)
 ```
 
 Design: `docs/superpowers/specs/2026-09-04-omnilingual-transcriber-design.md`
