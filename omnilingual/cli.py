@@ -31,7 +31,7 @@ from omnilingual.models import Segment, chunks_from_json
 from omnilingual.pipeline import LIVE_SESSION_KIND, estimate, prepare, run, run_from_chunks, work_dir_for
 from omnilingual.pipeline.live import LiveOptions, run_live
 from omnilingual.render.markdown import fmt_ts, render, render_english_only
-from omnilingual.stt.sarvam import SarvamSTT
+from omnilingual.stt import build_stt
 from omnilingual.translate.mayura import MayuraTranslator
 
 class _AppGroup(typer.core.TyperGroup):
@@ -68,7 +68,8 @@ def _fail(msg: str, code: int = 1) -> NoReturn:
 
 def _run_from_chunks(session_dir: Path, *, out: Path | None,
                      english_only: bool, estimate_only: bool,
-                     api_key: str | None, work_dir: Path | None) -> None:
+                     api_key: str | None, work_dir: Path | None,
+                     stt_provider: str, stt_model: str | None) -> None:
     """Finish a halted live session. Never returns (raises typer.Exit)."""
     if work_dir is not None:
         _fail("--work-dir has no effect with --from-chunks (the session cache is reused)")
@@ -84,15 +85,18 @@ def _run_from_chunks(session_dir: Path, *, out: Path | None,
         _fail(f"{session_dir} is not a live-session dir ({exc})")
     assert chunks  # narrowed by the guard above
     try:
-        settings = load_settings(api_key=api_key)
+        settings = load_settings(api_key=api_key, stt_provider=stt_provider, stt_model=stt_model)
+        stt = build_stt(settings)
         settings.require_key()
+        if settings.stt_provider == "groq":
+            settings.require_groq_key()
     except ConfigError as exc:
         _fail(str(exc))
     if estimate_only:
         duration = sum(c.duration_s for c in chunks)
-        cost = estimate(duration, chunks, settings)
+        cost = estimate(duration, chunks, settings, stt=stt)
         console.print(f"{escape(session_dir.name)}: {fmt_ts(duration)} audio, {len(chunks)} chunks")
-        console.print(f"Projected: STT ₹{duration / 3600 * settings.stt_inr_per_hour:.2f} + MT ~₹{cost.mt_chars / 10_000 * settings.mt_inr_per_10k_chars:.2f} = ~₹{cost.inr_estimate:.2f}")
+        console.print(f"Projected: STT ₹{duration / 3600 * getattr(stt, 'inr_per_hour', settings.stt_inr_per_hour):.2f} + MT ~₹{cost.mt_chars / 10_000 * settings.mt_inr_per_10k_chars:.2f} = ~₹{cost.inr_estimate:.2f}")
         raise typer.Exit(0)
     out_path = out or (session_dir / "transcript.md")
     try:
@@ -106,7 +110,7 @@ def _run_from_chunks(session_dir: Path, *, out: Path | None,
         # external value; the counter and the mark are ours.
         console.print(f"\\[{i}/{n}] {fmt_ts(seg.chunk.start_s)} {escape(seg.lang)} {seg.prob:.2f}{mark}")
 
-    transcript = run_from_chunks(session_dir, settings, SarvamSTT(settings),
+    transcript = run_from_chunks(session_dir, settings, stt,
                                  MayuraTranslator(settings),
                                  JsonCache(session_dir / "cache"), progress)
     out_path.write_text(render(transcript), encoding="utf-8")
@@ -132,6 +136,8 @@ def transcribe(
     english_only: Annotated[bool, typer.Option("--english-only", help="Also write <stem>.en.md with English text only.")] = False,
     estimate_only: Annotated[bool, typer.Option("--estimate", help="Chunk and price the recording. No API calls.")] = False,
     api_key: Annotated[Optional[str], typer.Option(help="Sarvam API key. Overrides SARVAM_API_KEY.")] = None,
+    stt_provider: Annotated[str, typer.Option("--stt", help="Speech-to-text backend: sarvam (default), mlx-whisper (Apple Silicon, free), faster-whisper (Intel/Linux CPU, free), groq (cloud, cheap).")] = "sarvam",
+    stt_model: Annotated[Optional[str], typer.Option("--stt-model", help="Override the STT model id for the chosen provider.")] = None,
     work_dir: Annotated[Optional[Path], typer.Option(help="Cache/work root. Default: <out dir>/.omnilingual")] = None,
     from_chunks: Annotated[Optional[Path], typer.Option("--from-chunks", help="Finish a halted live session dir")] = None,
     max_chunk_s: Annotated[float, typer.Option(help="Max chunk length in seconds (<30).")] = 28.0,
@@ -144,14 +150,20 @@ def transcribe(
         _fail("--from-chunks cannot be combined with RECORDING")
     if from_chunks is not None:
         _run_from_chunks(from_chunks, out=out, english_only=english_only,
-                          estimate_only=estimate_only, api_key=api_key, work_dir=work_dir)
+                          estimate_only=estimate_only, api_key=api_key, work_dir=work_dir,
+                          stt_provider=stt_provider, stt_model=stt_model)
     if recording is None:
         _fail("Missing argument 'RECORDING'.")
 
     out_path = out or recording.with_suffix(".md")
     work_root = work_dir or out_path.parent / ".omnilingual"
     lang_list = [s.strip() for s in langs.split(",") if s.strip()] if langs else []
-    settings = load_settings(api_key=api_key, langs=lang_list, max_chunk_s=max_chunk_s, min_chunk_s=min_chunk_s)
+    try:
+        settings = load_settings(api_key=api_key, langs=lang_list, max_chunk_s=max_chunk_s,
+                                 min_chunk_s=min_chunk_s, stt_provider=stt_provider, stt_model=stt_model)
+        stt = build_stt(settings)
+    except ConfigError as exc:
+        _fail(str(exc))
 
     # Bad chunk bounds would only surface after normalizing the whole recording, or
     # worse, as a wall of 400s from the API. Check them before doing any work.
@@ -176,13 +188,15 @@ def transcribe(
             duration, chunks = prepare(recording, wd, settings)
         except (FfmpegError, FfmpegMissingError) as exc:
             _fail(str(exc))
-        cost = estimate(duration, chunks, settings)
+        cost = estimate(duration, chunks, settings, stt=stt)
         console.print(f"{escape(recording.name)}: {fmt_ts(duration)} audio, {len(chunks)} chunks")
-        console.print(f"Projected: STT ₹{duration / 3600 * settings.stt_inr_per_hour:.2f} + MT ~₹{cost.mt_chars / 10_000 * settings.mt_inr_per_10k_chars:.2f} = ~₹{cost.inr_estimate:.2f}")
+        console.print(f"Projected: STT ₹{duration / 3600 * getattr(stt, 'inr_per_hour', settings.stt_inr_per_hour):.2f} + MT ~₹{cost.mt_chars / 10_000 * settings.mt_inr_per_10k_chars:.2f} = ~₹{cost.inr_estimate:.2f}")
         raise typer.Exit(0)
 
     try:
         settings.require_key()
+        if settings.stt_provider == "groq":
+            settings.require_groq_key()
     except ConfigError as exc:
         _fail(str(exc))
 
@@ -193,13 +207,13 @@ def transcribe(
         console.print(f"\\[{i}/{n}] {fmt_ts(seg.chunk.start_s)} {escape(seg.lang)} {seg.prob:.2f}{mark}")
 
     try:
-        transcript = run(recording, wd, settings, SarvamSTT(settings), MayuraTranslator(settings), JsonCache(wd / "cache"), progress)
+        transcript = run(recording, wd, settings, stt, MayuraTranslator(settings), JsonCache(wd / "cache"), progress)
     except (FfmpegError, FfmpegMissingError) as exc:
         _fail(str(exc))
     except QuotaError as exc:
         _fail(f"{exc}. Cached progress kept; re-run same command to resume.")
     except AuthError as exc:
-        _fail(f"{exc}. Check your Sarvam API key.")
+        _fail(f"{exc}. Check your API key.")
     except SarvamError as exc:
         _fail(str(exc))
 
@@ -232,6 +246,8 @@ def live(
     check_audio: Annotated[bool, typer.Option("--check-audio")] = False,
     english_only: Annotated[bool, typer.Option("--english-only")] = False,
     api_key: Annotated[str | None, typer.Option("--api-key")] = None,
+    stt_provider: Annotated[str, typer.Option("--stt", help="Speech-to-text backend: sarvam (default), mlx-whisper (Apple Silicon, free), faster-whisper (Intel/Linux CPU, free), groq (cloud, cheap).")] = "sarvam",
+    stt_model: Annotated[str | None, typer.Option("--stt-model", help="Override the STT model id for the chosen provider.")] = None,
     work_dir: Annotated[Path | None, typer.Option("--work-dir")] = None,
     verbose: Annotated[bool, typer.Option("-v")] = False,
 ):
@@ -294,8 +310,12 @@ def live(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lang_list = [s.strip() for s in langs.split(",") if s.strip()] if langs else []
     try:
-        settings = load_settings(api_key=api_key, langs=lang_list)
+        settings = load_settings(api_key=api_key, langs=lang_list,
+                                 stt_provider=stt_provider, stt_model=stt_model)
+        stt = build_stt(settings)
         settings.require_key()
+        if settings.stt_provider == "groq":
+            settings.require_groq_key()
     except ConfigError as exc:
         _fail(str(exc))
     opts = LiveOptions(
@@ -303,7 +323,7 @@ def live(
         target_s=target_s, max_chunk_s=max_chunk_s, min_chunk_s=min_chunk_s,
         noise_db=noise_db, stt_workers=stt_workers, max_cost=max_cost,
         work_root=work_dir, english_only=english_only)
-    code = run_live(opts, settings, SarvamSTT(settings),
+    code = run_live(opts, settings, stt,
                     MayuraTranslator(settings), status=say)
     raise typer.Exit(code=code)
 

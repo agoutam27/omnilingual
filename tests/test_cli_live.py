@@ -42,7 +42,7 @@ class FakeTranslator:
 @pytest.fixture
 def live_cli(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_mod, "ensure_ffmpeg", lambda: None)
-    monkeypatch.setattr(cli_mod, "SarvamSTT", FakeSTT)
+    monkeypatch.setattr(cli_mod, "build_stt", FakeSTT)
     monkeypatch.setattr(cli_mod, "MayuraTranslator", FakeTranslator)
     return tmp_path
 

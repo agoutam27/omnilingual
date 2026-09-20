@@ -30,7 +30,7 @@ def patched(monkeypatch, rec):
     """Stub out ffmpeg and network-touching pieces."""
     monkeypatch.setattr(cli, "ensure_ffmpeg", lambda: None)
     monkeypatch.setattr(cli, "prepare", lambda source, wd, s: (20.0, [Chunk(0, 0, 10.0, Path("a")), Chunk(1, 10.0, 20.0, Path("b"))]))
-    monkeypatch.setattr(cli, "SarvamSTT", lambda settings: object())
+    monkeypatch.setattr(cli, "build_stt", lambda settings: object())
     monkeypatch.setattr(cli, "MayuraTranslator", lambda settings: object())
     calls = {}
 
