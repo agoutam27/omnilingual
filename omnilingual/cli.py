@@ -31,6 +31,7 @@ from omnilingual.models import Segment, chunks_from_json
 from omnilingual.pipeline import LIVE_SESSION_KIND, estimate, prepare, run, run_from_chunks, work_dir_for
 from omnilingual.pipeline.live import LiveOptions, run_live
 from omnilingual.render.markdown import fmt_ts, render, render_english_only
+from omnilingual.diarize import build_diarizer
 from omnilingual.stt import build_stt
 from omnilingual.translate.mayura import MayuraTranslator
 
@@ -69,7 +70,8 @@ def _fail(msg: str, code: int = 1) -> NoReturn:
 def _run_from_chunks(session_dir: Path, *, out: Path | None,
                      english_only: bool, estimate_only: bool,
                      api_key: str | None, work_dir: Path | None,
-                     stt_provider: str, stt_model: str | None) -> None:
+                     stt_provider: str, stt_model: str | None,
+                     diarizer: str | None, num_speakers: int | None) -> None:
     """Finish a halted live session. Never returns (raises typer.Exit)."""
     if work_dir is not None:
         _fail("--work-dir has no effect with --from-chunks (the session cache is reused)")
@@ -85,8 +87,10 @@ def _run_from_chunks(session_dir: Path, *, out: Path | None,
         _fail(f"{session_dir} is not a live-session dir ({exc})")
     assert chunks  # narrowed by the guard above
     try:
-        settings = load_settings(api_key=api_key, stt_provider=stt_provider, stt_model=stt_model)
+        settings = load_settings(api_key=api_key, stt_provider=stt_provider, stt_model=stt_model,
+                                 diarizer=diarizer, num_speakers=num_speakers)
         stt = build_stt(settings)
+        dz = build_diarizer(settings) if settings.diarizer else None
         settings.require_key()
         if settings.stt_provider == "groq":
             settings.require_groq_key()
@@ -112,7 +116,8 @@ def _run_from_chunks(session_dir: Path, *, out: Path | None,
 
     transcript = run_from_chunks(session_dir, settings, stt,
                                  MayuraTranslator(settings),
-                                 JsonCache(session_dir / "cache"), progress)
+                                 JsonCache(session_dir / "cache"), progress,
+                                 diarizer=dz)
     out_path.write_text(render(transcript), encoding="utf-8")
     console.print(f"Wrote {escape(str(out_path))}")
     if english_only:
@@ -138,6 +143,9 @@ def transcribe(
     api_key: Annotated[Optional[str], typer.Option(help="Sarvam API key. Overrides SARVAM_API_KEY.")] = None,
     stt_provider: Annotated[str, typer.Option("--stt", help="Speech-to-text backend: sarvam (default), mlx-whisper (Apple Silicon, free), faster-whisper (Intel/Linux CPU, free), groq (cloud, cheap).")] = "sarvam",
     stt_model: Annotated[Optional[str], typer.Option("--stt-model", help="Override the STT model id for the chosen provider.")] = None,
+    diarize: Annotated[bool, typer.Option("--diarize", help="Label segments with per-chunk speakers (uses --diarizer, default sherpa).")] = False,
+    diarizer: Annotated[Optional[str], typer.Option("--diarizer", help="Speaker diarization backend: sherpa (local, free). Omit to disable.")] = None,
+    num_speakers: Annotated[Optional[int], typer.Option("--speakers", "--num-speakers", help="Expected speaker count; omit for auto-count.")] = None,
     work_dir: Annotated[Optional[Path], typer.Option(help="Cache/work root. Default: <out dir>/.omnilingual")] = None,
     from_chunks: Annotated[Optional[Path], typer.Option("--from-chunks", help="Finish a halted live session dir")] = None,
     max_chunk_s: Annotated[float, typer.Option(help="Max chunk length in seconds (<30).")] = 28.0,
@@ -151,7 +159,8 @@ def transcribe(
     if from_chunks is not None:
         _run_from_chunks(from_chunks, out=out, english_only=english_only,
                           estimate_only=estimate_only, api_key=api_key, work_dir=work_dir,
-                          stt_provider=stt_provider, stt_model=stt_model)
+                          stt_provider=stt_provider, stt_model=stt_model,
+                          diarizer=diarizer, num_speakers=num_speakers)
     if recording is None:
         _fail("Missing argument 'RECORDING'.")
 
@@ -160,8 +169,11 @@ def transcribe(
     lang_list = [s.strip() for s in langs.split(",") if s.strip()] if langs else []
     try:
         settings = load_settings(api_key=api_key, langs=lang_list, max_chunk_s=max_chunk_s,
-                                 min_chunk_s=min_chunk_s, stt_provider=stt_provider, stt_model=stt_model)
+                                 min_chunk_s=min_chunk_s, stt_provider=stt_provider, stt_model=stt_model,
+                                 diarizer=diarizer or ("sherpa" if diarize else None),
+                                 num_speakers=num_speakers)
         stt = build_stt(settings)
+        dz = build_diarizer(settings) if settings.diarizer else None
     except ConfigError as exc:
         _fail(str(exc))
 
@@ -207,7 +219,8 @@ def transcribe(
         console.print(f"\\[{i}/{n}] {fmt_ts(seg.chunk.start_s)} {escape(seg.lang)} {seg.prob:.2f}{mark}")
 
     try:
-        transcript = run(recording, wd, settings, stt, MayuraTranslator(settings), JsonCache(wd / "cache"), progress)
+        transcript = run(recording, wd, settings, stt, MayuraTranslator(settings), JsonCache(wd / "cache"), progress,
+                         diarizer=dz)
     except (FfmpegError, FfmpegMissingError) as exc:
         _fail(str(exc))
     except QuotaError as exc:
@@ -248,6 +261,9 @@ def live(
     api_key: Annotated[str | None, typer.Option("--api-key")] = None,
     stt_provider: Annotated[str, typer.Option("--stt", help="Speech-to-text backend: sarvam (default), mlx-whisper (Apple Silicon, free), faster-whisper (Intel/Linux CPU, free), groq (cloud, cheap).")] = "sarvam",
     stt_model: Annotated[str | None, typer.Option("--stt-model", help="Override the STT model id for the chosen provider.")] = None,
+    diarize: Annotated[bool, typer.Option("--diarize", help="Label segments with per-chunk speakers (uses --diarizer, default sherpa).")] = False,
+    diarizer: Annotated[str | None, typer.Option("--diarizer", help="Speaker diarization backend: sherpa (local, free). Omit to disable.")] = None,
+    num_speakers: Annotated[int | None, typer.Option("--speakers", "--num-speakers", help="Expected speaker count; omit for auto-count.")] = None,
     work_dir: Annotated[Path | None, typer.Option("--work-dir")] = None,
     verbose: Annotated[bool, typer.Option("-v")] = False,
 ):
@@ -311,8 +327,11 @@ def live(
     lang_list = [s.strip() for s in langs.split(",") if s.strip()] if langs else []
     try:
         settings = load_settings(api_key=api_key, langs=lang_list,
-                                 stt_provider=stt_provider, stt_model=stt_model)
+                                 stt_provider=stt_provider, stt_model=stt_model,
+                                 diarizer=diarizer or ("sherpa" if diarize else None),
+                                 num_speakers=num_speakers)
         stt = build_stt(settings)
+        dz = build_diarizer(settings) if settings.diarizer else None
         settings.require_key()
         if settings.stt_provider == "groq":
             settings.require_groq_key()
@@ -324,7 +343,7 @@ def live(
         noise_db=noise_db, stt_workers=stt_workers, max_cost=max_cost,
         work_root=work_dir, english_only=english_only)
     code = run_live(opts, settings, stt,
-                    MayuraTranslator(settings), status=say)
+                    MayuraTranslator(settings), diarizer=dz, status=say)
     raise typer.Exit(code=code)
 
 

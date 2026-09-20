@@ -42,6 +42,7 @@ def process_chunk(
     translator,
     cache: JsonCache,
     settings: Settings,
+    tracker=None,
 ) -> tuple[Segment, float, bool]:
     """Transcribe + translate one sealed chunk. Returns (segment, inr, billed).
 
@@ -52,10 +53,12 @@ def process_chunk(
         seg = Segment(chunk=chunk, lang="", prob=0.0, text="",
                       english=None, status="no_speech")
         return (seg, 0.0, False)
+    speaker = tracker.assign(chunk.wav_path) if tracker is not None else None
     result = _stt_cached(chunk, stt, cache)
     if result is None:
         seg = Segment(chunk=chunk, lang="unknown", prob=0.0,
-                      text=STT_FAILED_TEXT, english=None, status="stt_failed")
+                      text=STT_FAILED_TEXT, english=None, status="stt_failed",
+                      speaker=speaker)
         return (seg, _price(chunk.duration_s, 0, settings, stt), True)
     if settings.langs and result.lang not in settings.langs:
         log.warning(
@@ -64,23 +67,28 @@ def process_chunk(
         )
     if not result.text.strip():
         seg = Segment(chunk=chunk, lang=result.lang, prob=result.prob,
-                      text="", english=None, status="no_speech")
+                      text="", english=None, status="no_speech",
+                      speaker=speaker)
         return (seg, _price(chunk.duration_s, 0, settings, stt), True)
     if result.lang == "en-IN":
         seg = Segment(chunk=chunk, lang="en-IN", prob=result.prob,
-                      text=result.text, english=None, status="ok")
+                      text=result.text, english=None, status="ok",
+                      speaker=speaker)
         return (seg, _price(chunk.duration_s, 0, settings, stt), True)
     if not translator.supports(result.lang):
         seg = Segment(chunk=chunk, lang=result.lang, prob=result.prob,
-                      text=result.text, english=None, status="mt_unsupported")
+                      text=result.text, english=None, status="mt_unsupported",
+                      speaker=speaker)
         return (seg, _price(chunk.duration_s, 0, settings, stt), True)
     english = _mt_cached(result.text, result.lang, translator, cache)
     if english is None:
         seg = Segment(chunk=chunk, lang=result.lang, prob=result.prob,
-                      text=result.text, english=None, status="mt_failed")
-        return (seg, _price(chunk.duration_s, 0, settings, stt), True)
+                      text=result.text, english=None, status="mt_failed",
+                      speaker=speaker)
+        return (seg, _price(chunk.duration_s, len(result.text), settings, stt), True)
     seg = Segment(chunk=chunk, lang=result.lang, prob=result.prob,
-                  text=result.text, english=english, status="ok")
+                  text=result.text, english=english, status="ok",
+                  speaker=speaker)
     return (seg, _price(chunk.duration_s, len(result.text), settings, stt), True)
 
 
@@ -137,6 +145,7 @@ _HALT_TEXT = {
 
 
 def run_live(opts: LiveOptions, settings, stt, translator, *,
+             diarizer=None,
              status: Callable[[str], None] | None = None,
              capture_factory: Callable = LiveCapture) -> int:
     """Run a live session. Returns the process exit code (0/1/2)."""
@@ -156,6 +165,12 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
         "started_utc": stamp,
     }, indent=2), encoding="utf-8")
     cache = JsonCache(session / "cache")
+
+    tracker = None
+    if diarizer is not None:
+        from omnilingual.diarize.online import OnlineSpeakerTracker
+
+        tracker = OnlineSpeakerTracker(diarizer.chunk_embedder())
 
     capture = capture_factory(opts.device, mic_only=opts.mic_only,
                               noise_db=opts.noise_db)
@@ -310,7 +325,7 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
                 try:
                     item = process_chunk(sc.chunk, speech=sc.speech, stt=stt,
                                          translator=translator, cache=cache,
-                                         settings=settings)
+                                         settings=settings, tracker=tracker)
                 except QuotaError:
                     halt_once("quota",
                               f"[live {elapsed()}] API quota exceeded (402); "
