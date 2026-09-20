@@ -21,6 +21,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="run tests marked faster_whisper (real faster-whisper model, downloads ~500 MB)",
     )
+    parser.addoption(
+        "--run-diarize",
+        action="store_true",
+        default=False,
+        help="run tests marked diarize (real diarization models, downloads ~40 MB)",
+    )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -33,6 +39,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     skip_live = pytest.mark.skip(reason="need --run-live to run live tests")
     skip_mlx = pytest.mark.skip(reason="need --run-mlx to run mlx tests (Apple Silicon + local-stt extra)")
     skip_fw = pytest.mark.skip(reason="need --run-faster-whisper to run faster_whisper tests (downloads ~500 MB)")
+    skip_dz = pytest.mark.skip(reason="need --run-diarize to run diarize tests (downloads ~40 MB)")
     for item in items:
         if not config.getoption("--run-live") and "live" in item.keywords:
             item.add_marker(skip_live)
@@ -40,6 +47,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip_mlx)
         if not config.getoption("--run-faster-whisper") and "faster_whisper" in item.keywords:
             item.add_marker(skip_fw)
+        if not config.getoption("--run-diarize") and "diarize" in item.keywords:
+            item.add_marker(skip_dz)
 
 
 def raw_pcm(parts: list[tuple[str, float]], rate: int = 16000) -> bytes:

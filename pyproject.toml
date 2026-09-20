@@ -24,6 +24,11 @@ local-stt = [
     "faster-whisper>=1.0",
     "onnxruntime>=1.14,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
+# Speaker diarization via sherpa-onnx (pure ONNX runtime; works on Intel Macs).
+diarize = [
+    "sherpa-onnx>=1.12,<2",
+    "soundfile>=0.12",
+]
 
 [dependency-groups]
 dev = [
@@ -44,4 +49,5 @@ markers = [
     "live: hits the real Sarvam API; needs SARVAM_API_KEY",
     "mlx: runs the real local Whisper model; needs the local-stt extra on Apple Silicon",
     "faster_whisper: runs the real local faster-whisper model; needs the local-stt extra",
+    "diarize: runs the real local diarization models; needs the diarize extra",
 ]
