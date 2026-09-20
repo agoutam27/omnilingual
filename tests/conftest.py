@@ -12,6 +12,36 @@ requires_ffmpeg = pytest.mark.skipif(
 )
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption("--run-live", action="store_true", default=False, help="run tests marked live (real Sarvam API)")
+    parser.addoption("--run-mlx", action="store_true", default=False, help="run tests marked mlx (real mlx-whisper model)")
+    parser.addoption(
+        "--run-faster-whisper",
+        action="store_true",
+        default=False,
+        help="run tests marked faster_whisper (real faster-whisper model, downloads ~500 MB)",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # If the user explicitly filtered by marker (-m) or keyword (-k), let pytest
+    # handle it — don't second-guess. Auto-skip only for the default `pytest` run.
+    markexpr: str = config.getoption("markexpr") or ""
+    keyword: str = config.getoption("keyword") or ""
+    if markexpr or keyword:
+        return
+    skip_live = pytest.mark.skip(reason="need --run-live to run live tests")
+    skip_mlx = pytest.mark.skip(reason="need --run-mlx to run mlx tests (Apple Silicon + local-stt extra)")
+    skip_fw = pytest.mark.skip(reason="need --run-faster-whisper to run faster_whisper tests (downloads ~500 MB)")
+    for item in items:
+        if not config.getoption("--run-live") and "live" in item.keywords:
+            item.add_marker(skip_live)
+        if not config.getoption("--run-mlx") and "mlx" in item.keywords:
+            item.add_marker(skip_mlx)
+        if not config.getoption("--run-faster-whisper") and "faster_whisper" in item.keywords:
+            item.add_marker(skip_fw)
+
+
 def raw_pcm(parts: list[tuple[str, float]], rate: int = 16000) -> bytes:
     """Mono s16le PCM for ("tone"|"silence", seconds) parts. Test helper."""
     out = bytearray()
