@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from omnilingual.models import Chunk, Cost, Segment, Transcript
-from omnilingual.render.markdown import fmt_ts, lang_share, render, render_english_only
+from omnilingual.render.markdown import (
+    fmt_ts,
+    lang_share,
+    render,
+    render_english_only,
+    speaker_share,
+)
 
 GOLDEN = Path(__file__).parent / "golden"
 
@@ -120,3 +126,62 @@ def test_format_english_line_variants():
     assert format_english_line(Segment(_chunk(0), "hi-IN", 0.0, "[transcription failed]", None, "stt_failed")) == "[transcription failed]"
     assert format_english_line(Segment(_chunk(0), "ta-IN", 0.9, "வ", None, "mt_failed")) == "[ta-IN, untranslated]"
     assert format_english_line(Segment(_chunk(0), "hi-IN", 0.1, "", None, "no_speech")) is None
+
+
+def test_format_segment_with_speaker_prefixes_head():
+    seg = Segment(_chunk(0), "hi-IN", 0.97, "नमस्ते", "Hello", "ok", speaker="Speaker 2")
+    assert format_segment(seg) == [
+        "**[00:00:00 → 00:00:25] Speaker 2 · hi-IN**",
+        "नमस्ते",
+        "> Hello",
+        "",
+    ]
+
+
+def test_format_segment_without_speaker_is_unchanged():
+    seg = Segment(_chunk(0), "hi-IN", 0.97, "नमस्ते", "Hello", "ok")
+    assert format_segment(seg)[0] == "**[00:00:00 → 00:00:25] hi-IN**"
+
+
+def test_format_english_line_prefixes_speaker():
+    assert format_english_line(Segment(_chunk(0), "hi-IN", 0.9, "क", "EN[क]", "ok", speaker="Speaker 2")) == "Speaker 2: EN[क]"
+    assert format_english_line(Segment(_chunk(0), "en-IN", 0.9, "hello", None, "ok", speaker="Speaker 1")) == "Speaker 1: hello"
+    assert format_english_line(Segment(_chunk(0), "hi-IN", 0.0, "[transcription failed]", None, "stt_failed", speaker="Speaker 2")) == "Speaker 2: [transcription failed]"
+    assert format_english_line(Segment(_chunk(0), "ta-IN", 0.9, "வ", None, "mt_failed", speaker="Speaker 2")) == "Speaker 2: [ta-IN, untranslated]"
+    assert format_english_line(Segment(_chunk(0), "hi-IN", 0.1, "", None, "no_speech", speaker="Speaker 2")) is None
+
+
+def test_speaker_share_reports_speech_share_and_omits_silence():
+    segs = [
+        Segment(_chunk(0), "hi-IN", 0.9, "क", "EN", "ok", speaker="Speaker 1"),
+        Segment(_chunk(1), "ta-IN", 0.9, "வ", None, "mt_failed", speaker="Speaker 2"),
+        Segment(_chunk(2), "hi-IN", 0.1, "", None, "no_speech", speaker="Speaker 2"),
+    ]
+    assert speaker_share(segs) == [("Speaker 1", 50), ("Speaker 2", 50)]
+    assert speaker_share([]) == []
+
+
+def test_render_adds_speaker_line_only_when_labels_exist():
+    labelled = sample_transcript()
+    labelled.segments[0] = Segment(
+        labelled.segments[0].chunk,
+        labelled.segments[0].lang,
+        labelled.segments[0].prob,
+        labelled.segments[0].text,
+        labelled.segments[0].english,
+        labelled.segments[0].status,
+        speaker="Speaker 1",
+    )
+    labelled.segments[1] = Segment(
+        labelled.segments[1].chunk,
+        labelled.segments[1].lang,
+        labelled.segments[1].prob,
+        labelled.segments[1].text,
+        labelled.segments[1].english,
+        labelled.segments[1].status,
+        speaker="Speaker 2",
+    )
+    out = render(labelled)
+    assert "**[00:00:00 → 00:00:25] Speaker 1 · hi-IN**" in out
+    assert "Speakers: Speaker 1 50%, Speaker 2 50%" in out
+    assert "Speakers:" not in render(sample_transcript())

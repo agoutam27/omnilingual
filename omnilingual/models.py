@@ -37,6 +37,7 @@ class Segment:
     text: str
     english: str | None
     status: SegmentStatus
+    speaker: str | None = None
 
 
 @dataclass
