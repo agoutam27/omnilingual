@@ -25,7 +25,7 @@ class SarvamSTT:
         self._settings = settings
         self._client = client or httpx.Client(timeout=httpx.Timeout(60.0))
         self._sleep = sleep
-        self.model = settings.stt_model
+        self.model = settings.resolved_stt_model
 
     def transcribe(self, wav_path: Path) -> STTResult:
         key = self._settings.require_key()
