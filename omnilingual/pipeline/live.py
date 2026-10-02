@@ -59,7 +59,7 @@ def process_chunk(
         seg = Segment(chunk=chunk, lang="unknown", prob=0.0,
                       text=STT_FAILED_TEXT, english=None, status="stt_failed",
                       speaker=speaker)
-        return (seg, _price(chunk.duration_s, 0, settings, stt), True)
+        return (seg, _price(chunk.duration_s, 0, settings, stt, translator), True)
     if settings.langs and result.lang not in settings.langs:
         log.warning(
             "chunk %d: detected %s (p=%.2f) outside configured languages %s",
@@ -69,27 +69,27 @@ def process_chunk(
         seg = Segment(chunk=chunk, lang=result.lang, prob=result.prob,
                       text="", english=None, status="no_speech",
                       speaker=speaker)
-        return (seg, _price(chunk.duration_s, 0, settings, stt), True)
+        return (seg, _price(chunk.duration_s, 0, settings, stt, translator), True)
     if result.lang == "en-IN":
         seg = Segment(chunk=chunk, lang="en-IN", prob=result.prob,
                       text=result.text, english=None, status="ok",
                       speaker=speaker)
-        return (seg, _price(chunk.duration_s, 0, settings, stt), True)
+        return (seg, _price(chunk.duration_s, 0, settings, stt, translator), True)
     if not translator.supports(result.lang):
         seg = Segment(chunk=chunk, lang=result.lang, prob=result.prob,
                       text=result.text, english=None, status="mt_unsupported",
                       speaker=speaker)
-        return (seg, _price(chunk.duration_s, 0, settings, stt), True)
+        return (seg, _price(chunk.duration_s, 0, settings, stt, translator), True)
     english = _mt_cached(result.text, result.lang, translator, cache)
     if english is None:
         seg = Segment(chunk=chunk, lang=result.lang, prob=result.prob,
                       text=result.text, english=None, status="mt_failed",
                       speaker=speaker)
-        return (seg, _price(chunk.duration_s, len(result.text), settings, stt), True)
+        return (seg, _price(chunk.duration_s, len(result.text), settings, stt, translator), True)
     seg = Segment(chunk=chunk, lang=result.lang, prob=result.prob,
                   text=result.text, english=english, status="ok",
                   speaker=speaker)
-    return (seg, _price(chunk.duration_s, len(result.text), settings, stt), True)
+    return (seg, _price(chunk.duration_s, len(result.text), settings, stt, translator), True)
 
 
 """(continued) Threaded live run loop."""

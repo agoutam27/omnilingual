@@ -40,14 +40,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     skip_mlx = pytest.mark.skip(reason="need --run-mlx to run mlx tests (Apple Silicon + local-stt extra)")
     skip_fw = pytest.mark.skip(reason="need --run-faster-whisper to run faster_whisper tests (downloads ~500 MB)")
     skip_dz = pytest.mark.skip(reason="need --run-diarize to run diarize tests (downloads ~40 MB)")
+    # Match real marks only. `item.keywords` also holds name-derived keywords, so
+    # a plain `"diarize" in item.keywords` test skipped every test under
+    # tests/diarize/ — directory name included — which hid shipped-broken code.
     for item in items:
-        if not config.getoption("--run-live") and "live" in item.keywords:
+        if not config.getoption("--run-live") and item.get_closest_marker("live"):
             item.add_marker(skip_live)
-        if not config.getoption("--run-mlx") and "mlx" in item.keywords:
+        if not config.getoption("--run-mlx") and item.get_closest_marker("mlx"):
             item.add_marker(skip_mlx)
-        if not config.getoption("--run-faster-whisper") and "faster_whisper" in item.keywords:
+        if (
+            not config.getoption("--run-faster-whisper")
+            and item.get_closest_marker("faster_whisper")
+        ):
             item.add_marker(skip_fw)
-        if not config.getoption("--run-diarize") and "diarize" in item.keywords:
+        if not config.getoption("--run-diarize") and item.get_closest_marker("diarize"):
             item.add_marker(skip_dz)
 
 

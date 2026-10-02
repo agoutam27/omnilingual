@@ -43,7 +43,7 @@ class FakeTranslator:
 def live_cli(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_mod, "ensure_ffmpeg", lambda: None)
     monkeypatch.setattr(cli_mod, "build_stt", FakeSTT)
-    monkeypatch.setattr(cli_mod, "MayuraTranslator", FakeTranslator)
+    monkeypatch.setattr(cli_mod, "build_translator", FakeTranslator)
     return tmp_path
 
 

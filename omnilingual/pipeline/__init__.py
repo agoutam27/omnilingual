@@ -88,10 +88,20 @@ def prepare(source: Path, work_dir: Path, settings: Settings) -> tuple[float, li
     return duration, chunks
 
 
-def _price(audio_seconds: float, mt_chars: int, settings: Settings, stt: STTProvider | None = None) -> float:
+def _price(
+    audio_seconds: float,
+    mt_chars: int,
+    settings: Settings,
+    stt: STTProvider | None = None,
+    translator: Translator | None = None,
+) -> float:
+    """Rupee estimate. Providers override the settings default by exposing
+    `inr_per_hour` / `inr_per_10k_chars`; a free backend prices at zero."""
+
     rate = getattr(stt, "inr_per_hour", None)
     stt_cost = audio_seconds / 3600.0 * (rate if rate is not None else settings.stt_inr_per_hour)
-    mt = mt_chars / 10_000.0 * settings.mt_inr_per_10k_chars
+    mt_rate = getattr(translator, "inr_per_10k_chars", None)
+    mt = mt_chars / 10_000.0 * (mt_rate if mt_rate is not None else settings.mt_inr_per_10k_chars)
     return round(stt_cost + mt, 4)
 
 
@@ -101,10 +111,15 @@ def estimate(
     settings: Settings,
     chars_per_second: float = 15.0,
     stt: STTProvider | None = None,
+    translator: Translator | None = None,
 ) -> Cost:
     audio_seconds = sum(c.duration_s for c in chunks) or duration_s
     mt_chars = int(audio_seconds * chars_per_second)
-    return Cost(audio_seconds=audio_seconds, mt_chars=mt_chars, inr_estimate=_price(audio_seconds, mt_chars, settings, stt))
+    return Cost(
+        audio_seconds=audio_seconds,
+        mt_chars=mt_chars,
+        inr_estimate=_price(audio_seconds, mt_chars, settings, stt, translator),
+    )
 
 
 def _cached_call(
@@ -261,7 +276,8 @@ def transcribe_chunks(
         if progress:
             progress(i, len(chunks), seg)
 
-    cost = Cost(audio_seconds=duration_s, mt_chars=mt_chars, inr_estimate=_price(duration_s, mt_chars, settings, stt))
+    cost = Cost(audio_seconds=duration_s, mt_chars=mt_chars,
+                inr_estimate=_price(duration_s, mt_chars, settings, stt, translator))
     return Transcript(source=source, duration_s=duration_s, segments=segments, cost=cost)
 
 

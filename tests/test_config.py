@@ -9,7 +9,9 @@ def test_load_settings_reads_key_from_env():
     assert s.stt_model is None
     assert s.resolved_stt_model == "saaras:v4"
     assert s.stt_provider == "sarvam"
-    assert s.mt_model == "mayura:v1"
+    assert s.mt_provider == "mayura"
+    assert s.mt_model is None
+    assert s.resolved_mt_model == "mayura:v1"
     assert s.max_chunk_s == 28.0
     assert s.min_chunk_s == 5.0
 
@@ -71,6 +73,26 @@ def test_overrides_and_langs_tuple():
 def test_mt_char_limit_depends_on_model():
     assert load_settings(env={}).mt_char_limit == 1000
     assert load_settings(env={}, mt_model="sarvam-translate:v1").mt_char_limit == 2000
+    assert load_settings(env={}, mt_provider="gemini").mt_char_limit == 4000
+
+
+def test_resolved_mt_model_per_provider_and_override():
+    assert load_settings(env={}, mt_provider="gemini").resolved_mt_model == "gemini-3.5-flash"
+    s = load_settings(env={}, mt_provider="gemini", mt_model="gemini-3.8-flash")
+    assert s.resolved_mt_model == "gemini-3.8-flash"
+
+
+def test_unknown_mt_provider_rejected_at_load():
+    with pytest.raises(ConfigError, match="unknown MT provider"):
+        load_settings(env={}, mt_provider="bogus")
+
+
+def test_gemini_key_from_env_and_require():
+    s = load_settings(env={"GEMINI_API_KEY": "gk"})
+    assert s.gemini_api_key == "gk"
+    assert s.require_gemini_key() == "gk"
+    with pytest.raises(ConfigError, match="GEMINI_API_KEY"):
+        load_settings(env={}).require_gemini_key()
 
 
 def test_settings_is_frozen():

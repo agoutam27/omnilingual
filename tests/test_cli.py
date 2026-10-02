@@ -1,3 +1,4 @@
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,7 @@ def patched(monkeypatch, rec):
     monkeypatch.setattr(cli, "ensure_ffmpeg", lambda: None)
     monkeypatch.setattr(cli, "prepare", lambda source, wd, s: (20.0, [Chunk(0, 0, 10.0, Path("a")), Chunk(1, 10.0, 20.0, Path("b"))]))
     monkeypatch.setattr(cli, "build_stt", lambda settings: object())
-    monkeypatch.setattr(cli, "MayuraTranslator", lambda settings: object())
+    monkeypatch.setattr(cli, "build_translator", lambda settings: object())
     calls = {}
 
     def fake_run(source, wd, settings, stt, translator, cache, progress=None, diarizer=None):
@@ -83,6 +84,40 @@ def test_missing_key_exits_one(rec, patched, monkeypatch):
     result = runner.invoke(cli.app, [str(rec)])
     assert result.exit_code == 1
     assert "SARVAM_API_KEY" in result.output
+
+
+def test_free_backends_on_both_axes_need_no_sarvam_key(rec, patched, monkeypatch):
+    monkeypatch.delenv("SARVAM_API_KEY", raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "g")
+    monkeypatch.setenv("GEMINI_API_KEY", "gk")
+    result = runner.invoke(cli.app, [str(rec), "--stt", "groq", "--mt", "gemini"])
+    assert result.exit_code == 0, result.output
+    assert patched["settings"].mt_provider == "gemini"
+
+
+def test_gemini_mt_still_needs_sarvam_key_for_sarvam_stt(rec, patched, monkeypatch):
+    monkeypatch.delenv("SARVAM_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "gk")
+    result = runner.invoke(cli.app, [str(rec), "--mt", "gemini"])
+    assert result.exit_code == 1
+    assert "SARVAM_API_KEY" in result.output
+
+
+def test_gemini_without_its_key_exits_one(rec, patched, monkeypatch):
+    monkeypatch.setenv("SARVAM_API_KEY", "sk")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    result = runner.invoke(cli.app, [str(rec), "--api-key", "sk", "--mt", "gemini"])
+    assert result.exit_code == 1
+    assert "GEMINI_API_KEY" in result.output
+
+
+def test_estimate_prices_gemini_translation_as_free(rec, patched, monkeypatch):
+    monkeypatch.delenv("SARVAM_API_KEY", raising=False)
+    monkeypatch.setattr(cli, "build_translator", lambda settings: type(
+        "T", (), {"inr_per_10k_chars": 0.0})())
+    result = runner.invoke(cli.app, [str(rec), "--estimate", "--mt", "gemini"])
+    assert result.exit_code == 0, result.output
+    assert "MT ~₹0.00" in result.output
 
 
 def test_estimate_needs_no_key_and_makes_no_run(rec, patched, monkeypatch):
@@ -261,6 +296,10 @@ def test_progress_line_renders_literal_counter_brackets(rec, patched):
 # --- Speaker diarization flags -------------------------------------------------
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("sherpa_onnx") is not None,
+    reason="the diarize extra is installed, so the missing-extra path can't be reached",
+)
 def test_diarize_without_extra_exits_one(rec, patched):
     result = runner.invoke(cli.app, [str(rec), "--api-key", "k", "--diarize"])
     assert result.exit_code == 1

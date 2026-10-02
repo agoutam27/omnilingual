@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tarfile
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -33,6 +35,63 @@ def _default_model_dir() -> Path:
     return Path.home() / ".cache" / "omnilingual" / "models"
 
 
+def _mb(n: int) -> str:
+    return f"{n / 1_000_000:.1f} MB"
+
+
+class _DownloadProgress:
+    """Throttled stderr progress for a model fetch.
+
+    `live --diarize` builds the tracker before it prints anything, so a silent
+    ~46 MB download reads as a hang. Updates are throttled to ~1/sec: a
+    carriage-return line on a TTY, discrete lines when stderr is redirected.
+    """
+
+    _interval = 1.0
+
+    def __init__(self, label: str, total: int | None) -> None:
+        self._label = label
+        self._total = total
+        self._done = 0
+        self._started = time.monotonic()
+        self._last = 0.0
+        self._tty = sys.stderr.isatty()
+        self._prev = ""
+
+    def start(self) -> None:
+        size = f" ({_mb(self._total)})" if self._total else ""
+        sys.stderr.write(f"downloading {self._label}{size}\n")
+        sys.stderr.flush()
+
+    def advance(self, n: int) -> None:
+        self._done += n
+        now = time.monotonic()
+        complete = self._total is not None and self._done >= self._total
+        if not complete and now - self._last < self._interval:
+            return
+        self._last = now
+        line = self._render(now)
+        if self._tty:
+            sys.stderr.write("\r" + line + " " * max(0, len(self._prev) - len(line)))
+            self._prev = line
+        else:
+            sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+    def close(self) -> None:
+        if self._tty and self._prev:
+            sys.stderr.write("\n")
+            self._prev = ""
+        sys.stderr.flush()
+
+    def _render(self, now: float) -> str:
+        rate = self._done / max(now - self._started, 1e-6) / 1_000_000
+        if not self._total:
+            return f"  {self._label} {_mb(self._done)} at {rate:.2f} MB/s"
+        pct = 100.0 * self._done / self._total
+        return f"  {self._label} {pct:.0f}% {_mb(self._done)}/{_mb(self._total)} at {rate:.2f} MB/s"
+
+
 def _http_download(url: str, dest: Path) -> None:
     """Stream a URL to dest atomically; extracts the segmentation tarball."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -41,9 +100,16 @@ def _http_download(url: str, dest: Path) -> None:
     try:
         with httpx.stream("GET", url, follow_redirects=True, timeout=300.0) as resp:
             resp.raise_for_status()
-            with tmp_path.open("wb") as f:
-                for chunk in resp.iter_bytes():
-                    f.write(chunk)
+            length = resp.headers.get("content-length")
+            progress = _DownloadProgress(url.rsplit("/", 1)[-1], int(length) if length else None)
+            progress.start()
+            try:
+                with tmp_path.open("wb") as f:
+                    for chunk in resp.iter_bytes():
+                        f.write(chunk)
+                        progress.advance(len(chunk))
+            finally:
+                progress.close()
         if url.endswith(".tar.bz2"):
             with tempfile.TemporaryDirectory(dir=str(dest.parent)) as td:
                 with tarfile.open(tmp_path, "r:bz2") as tar:
@@ -169,9 +235,12 @@ class _SherpaEngine:
 
         diarizer = self._ensure_diarizer()
         samples, _rate = sf.read(str(wav_path), dtype="float32", always_2d=False)
+        # process() returns an OfflineSpeakerDiarizationResult, which is not
+        # iterable; sort_by_start_time() is what hands back the segment list.
+        segments = diarizer.process(samples).sort_by_start_time()
         return [
             Turn(start_s=float(s.start), end_s=float(s.end), speaker=str(s.speaker))
-            for s in diarizer.process(samples)
+            for s in segments
         ]
 
     def embedder(self) -> Callable[[Path], object]:
@@ -191,7 +260,12 @@ class _SherpaEngine:
                 )
             import soundfile as sf
 
-            samples, _rate = sf.read(str(wav_path), dtype="float32", always_2d=False)
-            return extractor.compute(samples)
+            samples, rate = sf.read(str(wav_path), dtype="float32", always_2d=False)
+            # compute() takes an OnlineStream, not samples; feeding one WAV is
+            # create_stream -> accept_waveform -> input_finished -> compute.
+            stream = extractor.create_stream()
+            stream.accept_waveform(rate, samples)
+            stream.input_finished()
+            return extractor.compute(stream)
 
         return embed

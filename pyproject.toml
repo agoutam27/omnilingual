@@ -25,9 +25,29 @@ local-stt = [
     "onnxruntime>=1.14,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 # Speaker diarization via sherpa-onnx (pure ONNX runtime; works on Intel Macs).
+# sherpa-onnx-core is listed explicitly even though sherpa-onnx already depends
+# on it: uv's project resolver drops that transitive entry from uv.lock, so the
+# core never gets installed and the three dylibs under sherpa_onnx/lib/ stay
+# missing — which surfaces only at import time on macOS as "Library not loaded:
+# @rpath/libonnxruntime.dylib". Requiring it directly puts it in the lock.
 diarize = [
     "sherpa-onnx>=1.12,<2",
+    "sherpa-onnx-core>=1.12,<2",
     "soundfile>=0.12",
+]
+# Local on-device IndicTrans2 translation (CTranslate2 int8, CPU, no GPU needed):
+# - ctranslate2 has an Intel-mac wheel and pulls only numpy + pyyaml; it quantizes
+#   the float32 checkpoint to int8 as it loads, which is what keeps the ~850 MB
+#   download affordable on a 16 GB Intel Mac.
+# - sentencepiece and huggingface-hub stand in for the model's own tokenizer code
+#   and its download. The obvious alternative, transformers, needs torch (~2.5 GB)
+#   for nothing else here, so it is deliberately left out.
+# - The checkpoint is a community conversion (see config.DEFAULT_MT_MODELS); the
+#   official ai4bharat one is gated and can only be converted with torch present.
+local-mt = [
+    "ctranslate2>=4.5",
+    "sentencepiece>=0.2",
+    "huggingface-hub>=0.27",
 ]
 
 [dependency-groups]

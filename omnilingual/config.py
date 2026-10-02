@@ -22,6 +22,31 @@ DEFAULT_STT_MODELS: dict[str, str] = {
     "faster-whisper": "small",
 }
 
+MT_PROVIDERS: tuple[str, ...] = ("mayura", "gemini", "indictrans2")
+
+# Same rule as DEFAULT_STT_MODELS: mt_model=None means "the provider's own
+# default", so --mt gemini never sends a Sarvam model id to Google.
+DEFAULT_MT_MODELS: dict[str, str] = {
+    "mayura": "mayura:v1",
+    "gemini": "gemini-3.5-flash",
+    # A community CTranslate2 conversion, not an ai4bharat release: converting the
+    # official checkpoint needs torch, and the official repo is gated.
+    "indictrans2": "adalat-ai/ct2-rotary-indictrans2-indic-en-dist-200M",
+}
+
+# Per-model input caps, in characters. Mayura rejects long inputs, so it is the
+# tightest. Gemini's context window is orders of magnitude larger, so bigger
+# pieces mean fewer requests and more context to resolve pronouns within a chunk.
+# IndicTrans2 gets a small cap despite a far larger window: its own inference
+# engine documents a 256-token limit and translates sentence-at-a-time, past
+# which it repeats itself instead of translating.
+MT_CHAR_LIMITS: dict[str, int] = {
+    "mayura:v1": 1000,
+    "sarvam-translate:v1": 2000,
+    "adalat-ai/ct2-rotary-indictrans2-indic-en-dist-200M": 200,
+}
+DEFAULT_MT_CHAR_LIMIT = 4000
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -30,9 +55,12 @@ class Settings:
     stt_provider: str = "sarvam"
     stt_model: str | None = None
     groq_api_key: str | None = None
+    gemini_api_key: str | None = None
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     diarizer: str | None = None
     num_speakers: int | None = None
-    mt_model: str = "mayura:v1"
+    mt_provider: str = "mayura"
+    mt_model: str | None = None
     mt_mode: str = "formal"
     max_chunk_s: float = 28.0
     min_chunk_s: float = 5.0
@@ -42,7 +70,18 @@ class Settings:
 
     @property
     def mt_char_limit(self) -> int:
-        return 1000 if self.mt_model == "mayura:v1" else 2000
+        return MT_CHAR_LIMITS.get(self.resolved_mt_model, DEFAULT_MT_CHAR_LIMIT)
+
+    @property
+    def resolved_mt_model(self) -> str:
+        try:
+            default = DEFAULT_MT_MODELS[self.mt_provider]
+        except KeyError:
+            raise ConfigError(
+                f"unknown MT provider {self.mt_provider!r} "
+                f"(choose from: {', '.join(MT_PROVIDERS)})"
+            ) from None
+        return self.mt_model or default
 
     @property
     def resolved_stt_model(self) -> str:
@@ -69,6 +108,13 @@ class Settings:
             )
         return self.groq_api_key
 
+    def require_gemini_key(self) -> str:
+        if not self.gemini_api_key:
+            raise ConfigError(
+                "Gemini API key missing. Set GEMINI_API_KEY."
+            )
+        return self.gemini_api_key
+
 
 def load_settings(
     api_key: str | None = None,
@@ -77,11 +123,17 @@ def load_settings(
 ) -> Settings:
     env = os.environ if env is None else env
     key = api_key or env.get("SARVAM_API_KEY") or None
-    settings = Settings(api_key=key, groq_api_key=env.get("GROQ_API_KEY") or None)
+    settings = Settings(
+        api_key=key,
+        groq_api_key=env.get("GROQ_API_KEY") or None,
+        gemini_api_key=env.get("GEMINI_API_KEY") or None,
+    )
     if "langs" in overrides:
         overrides["langs"] = tuple(overrides["langs"])
     settings = replace(settings, **overrides)
-    settings.resolved_stt_model  # validate stt_provider early, before any paid work
+    # Validate both providers early, before any paid work.
+    settings.resolved_stt_model
+    settings.resolved_mt_model
     if settings.num_speakers is not None and settings.num_speakers < 2:
         raise ConfigError(
             f"num_speakers must be at least 2, got {settings.num_speakers}"

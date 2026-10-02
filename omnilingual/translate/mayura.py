@@ -57,7 +57,7 @@ class MayuraTranslator:
         self._settings = settings
         self._client = client or httpx.Client(timeout=httpx.Timeout(60.0))
         self._sleep = sleep
-        self.model = settings.mt_model
+        self.model = settings.resolved_mt_model
 
     def supports(self, lang: str) -> bool:
         langs = MAYURA_LANGS if self.model == "mayura:v1" else SARVAM_TRANSLATE_LANGS
