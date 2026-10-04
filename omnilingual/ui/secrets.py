@@ -8,7 +8,7 @@ appending a duplicate or leaving a stale one, mode 0600, write atomically. That
 shell implementation cannot be imported, so this is a cross-language duplication
 of a small invariant set; if one changes, change both.
 
-Two deliberate divergences from the shell, both applied uniformly across
+Three deliberate divergences from the shell, all applied uniformly across
 present/set_key/clear so the three can never disagree about which lines belong
 to a key:
 
@@ -17,6 +17,9 @@ to a key:
     the more useful behaviour.
   - present() resolves a duplicated key to its last line, matching env_get's
     `tail -n 1`.
+  - A CRLF .env keeps its \r on every line except the one just written, which
+    takes env_set's plain \n. Lines are split on \n alone for the same reason:
+    str.splitlines() would rewrite the whole file's line endings.
 """
 
 from __future__ import annotations
@@ -53,9 +56,24 @@ def _unquote(value: str) -> str:
 
 def _lines() -> list[str]:
     try:
-        return env_path().read_text(encoding="utf-8").splitlines()
-    except OSError:
+        # newline="" disables universal-newline translation. read_text() would
+        # rewrite \r\n to \n on the way in, and no split() can preserve a \r that
+        # the read already destroyed — which is how one set_key used to restyle
+        # every line ending in a CRLF .env.
+        with env_path().open("r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+    except (OSError, ValueError):
+        # ValueError is the UnicodeDecodeError of a .env that is not UTF-8, which
+        # is not an OSError and would otherwise escape every caller.
         return []
+    # Split on \n alone. str.splitlines() also breaks on \r, \x0b, \x0c, \x85 and
+    # \u2028, so a \u2028 inside a value split one line into two and injected
+    # tail as an orphan line on the next write. One trailing "" means the file
+    # ended with a newline; drop just that.
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def present() -> dict[str, bool]:
@@ -83,9 +101,17 @@ def set_key(name: str, value: str) -> None:
     hand-duplicated key it rewrites every copy. Rewriting only the first would
     leave the second holding the previous value — a live secret surviving a
     rotation the user believes was complete.
+
+    A pasted value arrives with a trailing newline often enough to be the common
+    case, and a newline followed by more content would silently add a second key
+    to the file the CLI loads. So trim, then refuse anything still multiline.
+    The error names the key only: a value must never reach a log or a traceback.
     """
     if name not in KEYS:
         raise ValueError(f"unknown key: {name}")
+    value = value.strip()
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"value for {name} must be a single line")
     lines = _lines()
     pattern = _assign(name)
     replaced = False
@@ -114,7 +140,10 @@ def _write(lines: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".env-")
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+        # newline="" on the write side too, so "\n" is written verbatim instead
+        # of being translated to os.linesep — otherwise the \r preserved above
+        # would mix with CRLF on any platform whose separator is not "\n".
+        with os.fdopen(handle, "w", encoding="utf-8", newline="") as fh:
             fh.write("\n".join(lines) + "\n")
         os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
         os.replace(tmp, path)

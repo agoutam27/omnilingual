@@ -15,12 +15,35 @@ def test_defaults_mirror_the_cli_flag_surface(tmp_path, monkeypatch):
     assert settings.load() == settings.DEFAULTS
 
 
-def test_defaults_cover_every_panel_control():
-    for key in ("mode", "source", "out", "stt", "stt_model", "mt", "mt_model",
-                "diarize", "num_speakers", "langs", "english_only", "work_dir",
-                "device", "mic_only", "target_s", "max_chunk_s", "min_chunk_s",
-                "noise_db", "stt_workers", "max_cost"):
-        assert key in settings.DEFAULTS, f"{key} missing from DEFAULTS"
+def test_defaults_are_exactly_the_specified_parameter_table():
+    """Pins every value, so a mutated default fails here rather than in a run.
+
+    Key-presence alone proved nothing: max_chunk_s could sit at 30.0 (above
+    MAX_CHUNK_LIMIT_S, which the CLI rejects), stt at a backend that does not
+    exist, and every test still passed.
+    """
+    assert settings.DEFAULTS == {
+        "mode": "live",
+        "source": "",
+        "out": "standup.md",
+        "stt": "sarvam",
+        "stt_model": "",
+        "mt": "mayura",
+        "mt_model": "",
+        "diarize": False,
+        "num_speakers": 3,
+        "langs": [],
+        "english_only": False,
+        "work_dir": "",
+        "device": "Omnilingual",
+        "mic_only": False,
+        "target_s": 8.0,
+        "max_chunk_s": 28.0,
+        "min_chunk_s": 5.0,
+        "noise_db": -35.0,
+        "stt_workers": 2,
+        "max_cost": 50.0,
+    }
 
 
 def test_save_then_load_round_trips(tmp_path, monkeypatch):
@@ -80,6 +103,40 @@ def test_load_falls_back_to_defaults_on_corrupt_file(tmp_path, monkeypatch):
     settings.settings_path().write_text("this is not = valid toml [[[",
                                         encoding="utf-8")
     assert settings.load() == settings.DEFAULTS
+
+
+def test_load_falls_back_to_defaults_on_a_non_utf8_file(tmp_path, monkeypatch):
+    """A byte-invalid store must not stop the panel opening.
+
+    UnicodeDecodeError is a ValueError, not an OSError, so the OSError-only
+    guard let a mangled ui.toml raise straight through a load() that promises
+    never to raise.
+    """
+    _isolated(tmp_path, monkeypatch)
+    path = settings.config_dir() / "ui.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'out = "\xff\xfe-cafe"\n')
+    assert settings.load() == settings.DEFAULTS
+
+
+def test_save_round_trips_booleans_as_booleans(tmp_path, monkeypatch):
+    """Identity, not equality: a bool must not come back as the string "false".
+
+    `diarize = "false"` is valid TOML and bool("false") is True, so a lost bool
+    branch would silently switch speaker labelling — which costs money — back on.
+    """
+    _isolated(tmp_path, monkeypatch)
+    settings.save({"diarize": True, "mic_only": False, "english_only": True})
+    loaded = settings.load()
+    assert loaded["diarize"] is True
+    assert loaded["mic_only"] is False
+    assert loaded["english_only"] is True
+
+
+def test_save_round_trips_a_non_empty_lang_list(tmp_path, monkeypatch):
+    _isolated(tmp_path, monkeypatch)
+    settings.save({"langs": ["hi-IN", "ta-IN", "en-IN"]})
+    assert settings.load()["langs"] == ["hi-IN", "ta-IN", "en-IN"]
 
 
 def test_load_does_not_create_a_file(tmp_path, monkeypatch):

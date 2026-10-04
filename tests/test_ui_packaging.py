@@ -170,17 +170,23 @@ def test_ui_package_is_a_real_module_not_namespace():
     )
 
 
-def test_ui_init_has_no_web_imports():
-    """Assert omnilingual/ui/__init__.py contains no import/fastapi/uvicorn/pywebview."""
-    init_path = (
-        Path(__file__).resolve().parents[1] / "omnilingual" / "ui" / "__init__.py"
-    )
-    source = init_path.read_text(encoding="utf-8")
-    for lib in ("fastapi", "uvicorn", "pywebview"):
-        # Check both bare `import` and `from ... import` forms
-        assert f"import {lib}" not in source, (
-            f"{lib} imported in omnilingual/ui/__init__.py — should not be there"
-        )
-        assert f"from {lib}" not in source, (
-            f"{lib} from-import in omnilingual/ui/__init__.py — should not be there"
-        )
+def test_ui_package_has_no_web_imports():
+    """Assert no module in omnilingual/ui/ imports fastapi, uvicorn or pywebview.
+
+    Scans the whole package rather than just the initializer: `ui.toml` settings
+    and `.env` handling are stdlib-only precisely so they stay importable without
+    the extra, and a web import in either would put the CLI back on that path.
+    """
+    ui_dir = Path(__file__).resolve().parents[1] / "omnilingual" / "ui"
+    modules = sorted(ui_dir.glob("*.py"))
+    assert modules, f"no modules found in {ui_dir}"
+    for path in modules:
+        source = path.read_text(encoding="utf-8")
+        for lib in ("fastapi", "uvicorn", "pywebview"):
+            # Check both bare `import` and `from ... import` forms
+            assert f"import {lib}" not in source, (
+                f"{lib} imported in omnilingual/ui/{path.name} — should not be there"
+            )
+            assert f"from {lib}" not in source, (
+                f"{lib} from-import in omnilingual/ui/{path.name} — should not be there"
+            )

@@ -18,7 +18,7 @@ from pathlib import Path
 # One entry per control in the spec's parameter table. The numeric and provider
 # defaults match the CLI's own, so the panel opens on the configuration the
 # command line would have used; the ones the CLI derives at runtime (out, langs,
-# num_speakers, work_dir) carry the panel's own opening values instead.
+# num_speakers) carry the panel's own opening values instead.
 DEFAULTS: dict[str, object] = {
     "mode": "live",
     "source": "",
@@ -31,6 +31,12 @@ DEFAULTS: dict[str, object] = {
     "num_speakers": 3,
     "langs": [],
     "english_only": False,
+    # "" is deliberate, not a missing value. cli.py computes
+    # `work_dir or out_path.parent / ".omnilingual"`, so empty falls through to
+    # the effective default — .omnilingual beside the output file — whereas
+    # storing the literal ".omnilingual" would pin the work directory to the
+    # process CWD instead. §9's table abbreviates that effective default; it is
+    # not a literal for the UI to store.
     "work_dir": "",
     "device": "Omnilingual",
     "mic_only": False,
@@ -61,7 +67,10 @@ def load() -> dict[str, object]:
     values = dict(DEFAULTS)
     try:
         stored = tomllib.loads(settings_path().read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, ValueError):
+        # ValueError covers TOMLDecodeError and the UnicodeDecodeError of a
+        # store that is not UTF-8 — neither is an OSError, and load() promises
+        # never to raise.
         return values
     for key, value in stored.items():
         if key in DEFAULTS:  # ignore junk keys rather than importing them
