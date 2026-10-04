@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 omnilingual = "omnilingual.cli:app"
+omnilingual-ui = "omnilingual.ui.__main__:main"
 
 [project.optional-dependencies]
 # Local on-device Whisper:
@@ -48,6 +49,14 @@ local-mt = [
     "ctranslate2>=4.5",
     "sentencepiece>=0.2",
     "huggingface-hub>=0.27",
+]
+# Web UI dependencies (fastapi, uvicorn, pywebview).
+# These are strictly optional — the CLI never acquires them so that
+# `uv run omnilingual transcribe` never pulls in web dependencies.
+ui = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pywebview>=5.0",
 ]
 
 [dependency-groups]
