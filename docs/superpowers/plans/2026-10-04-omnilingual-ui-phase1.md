@@ -1130,6 +1130,14 @@ Wraps the existing `scripts/audio-devices.swift` helper, which `setup-mac.sh` al
 
 Create `tests/ui/test_audio.py`:
 
+> **Authoritative sample.** The block below is `tests/ui/test_audio.py` verbatim as
+> shipped at `302de17` — 33 test functions, 34 cases (one is parametrised). It
+> supersedes the 10-test list this step originally prescribed: those 10 are still
+> present and still pass, but review found three defects they did not catch, and
+> 23 further tests now guard them. If this block and the shipped file ever
+> disagree, the shipped file wins — do not copy a subset of it.
+>
+
 ```python
 import subprocess
 
@@ -1151,6 +1159,13 @@ def _ready(**over):
                   mic_authorized=True, output="Speakers", detail=[])
     fields.update(over)
     return audio.Readiness(**fields)
+
+
+# What the helper's `list` prints once setup() has run, in its real "uid | name"
+# shape rather than the bare names the brief's own tests use.
+_FULL_LISTING = ("BlackHole_2ch | BlackHole 2ch\n"
+                 "omnilingual.aggregate | Omnilingual\n"
+                 "BuiltInMicDevice | MacBook Pro Microphone\n")
 
 
 def test_readiness_ok_requires_all_five_signals():
@@ -1235,14 +1250,387 @@ def test_restart_daemon_uses_the_mac_authorisation_prompt(monkeypatch):
     joined = " ".join(seen[0])
     assert "killall coreaudiod" in joined
     assert "administrator privileges" in joined
+
+
+# --- below: coverage the brief's list leaves open.  Same rules, narrower claims.
+
+
+def test_probe_consults_switchaudiosource_read_only(monkeypatch):
+    """Stronger form of the read-only claim: probe really does run a command.
+
+    The brief's version stubs `_current_output` away, so it cannot fail even if
+    probe started setting the output.  Here only `_current_output`'s own internals
+    are left intact, so the assertion is on a command that was actually issued.
+    """
+    calls = []
+
+    def fake_run(cmd, **k):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="Speakers", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: "omnilingual.aggregate | Omnilingual\n")
+    result = audio.probe(device="Omnilingual", mic=False)
+    assert result.output == "Speakers"
+    switches = [cmd for cmd in calls if "SwitchAudioSource" in cmd]
+    assert switches, "probe should report the current output device"
+    assert all("-c" in cmd and "-s" not in cmd for cmd in switches)
+
+
+def test_current_output_is_none_when_switchaudiosource_is_absent(monkeypatch, no_sudo):
+    monkeypatch.setattr(audio.shutil, "which", lambda name: None)
+    assert audio._current_output() is None
+
+
+def test_probe_does_not_claim_a_denial_it_never_observed(monkeypatch, no_sudo):
+    """No device means no capture was attempted, so no denial may be reported.
+
+    `no_sudo` turns any stray subprocess call into a failure, which is what makes
+    "not probed" observable rather than asserted in prose.
+    """
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: "BlackHole_2ch | BlackHole 2ch\n")
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=True)
+    assert result.device is False and result.blackhole is True
+    assert result.mic_authorized is False
+    assert not any("microphone" in line.lower() for line in result.detail)
+
+
+def test_probe_reports_the_missing_device_and_blackhole(monkeypatch, no_sudo):
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: "BuiltInMicDevice | MacBook Pro Microphone\n")
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=False)
+    joined = " ".join(result.detail)
+    assert "Omnilingual" in joined
+    assert "brew install blackhole-2ch" in joined
+    assert result.mic_authorized is True and not any(
+        "microphone" in line.lower() for line in result.detail)
+
+
+def test_probe_reports_the_mic_as_authorized_when_the_probe_is_skipped(monkeypatch):
+    """mic=False means "not asked", so the answer must not be a false alarm.
+
+    Task 6 returns probe(mic=False) from both fix endpoints, so flipping the
+    unprobed branch to False would put "microphone access denied" in the banner
+    of every *successful* setup while this suite stayed green.
+    """
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: _FULL_LISTING)
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=False)
+    assert result.mic_authorized is True
+    assert not any("microphone" in line.lower() for line in result.detail)
+
+
+def test_probe_keeps_the_skipped_mic_authorized_even_with_no_device(monkeypatch, no_sudo):
+    """Unprobed outranks "device missing": the branch order must not hide it."""
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: "")
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=False)
+    assert result.device is False
+    assert result.mic_authorized is True
+
+
+def test_probe_survives_a_helper_that_cannot_be_compiled(monkeypatch, no_sudo):
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "_current_output", lambda: None)
+
+    def no_such_helper():
+        raise FileNotFoundError("no swiftc")
+
+    monkeypatch.setattr(audio, "device_list", no_such_helper)
+    result = audio.probe(device="Omnilingual", mic=False)
+    assert result.device is False and result.blackhole is False
+    assert any("audio-device helper" in line for line in result.detail)
+
+
+def test_mic_probe_captures_exactly_one_second_through_ffmpeg(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = cmd
+        seen["kwargs"] = k
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert audio._mic_authorized("Omnilingual") is True
+    assert seen["cmd"][0] == "ffmpeg"
+    assert seen["cmd"][seen["cmd"].index("-f") + 1] == "avfoundation"
+    assert seen["cmd"][seen["cmd"].index("-t") + 1] == "1"
+    # The colon is load-bearing: a bare name asks avfoundation for a *video*
+    # device and fails "Video device not found" on a machine whose mic is fine.
+    assert seen["cmd"][seen["cmd"].index("-i") + 1] == ":Omnilingual"
+    assert seen["kwargs"].get("shell") in (None, False)
+
+
+def test_capture_verdict_points_at_privacy_settings_on_a_real_denial(monkeypatch):
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **k: subprocess.CompletedProcess(
+            cmd, 1, stdout="",
+            stderr="[AVFoundation indev] Error opening input: Permission denied"))
+    ok, reason = audio._capture_verdict("Omnilingual")
+    assert ok is False
+    assert "Privacy & Security" in reason
+
+
+def test_capture_verdict_does_not_blame_permission_for_another_failure(monkeypatch):
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **k: subprocess.CompletedProcess(
+            cmd, 251, stdout="",
+            stderr="[AVFoundation indev] Video device not found\n"
+                   "Error opening input file :Omnilingual."))
+    ok, reason = audio._capture_verdict("Omnilingual")
+    assert ok is False
+    assert "Privacy & Security" not in reason
+    assert "Error opening input file" in reason
+
+
+def test_probe_does_not_blame_permission_for_an_unrelated_capture_failure(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **k):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(
+            cmd, 251, stdout="",
+            stderr="[AVFoundation indev] Video device not found\n"
+                   "Error opening input file :Omnilingual.")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: "omnilingual.aggregate | Omnilingual\n")
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=True)
+    assert result.mic_authorized is False
+    joined = " ".join(result.detail)
+    assert "Error opening input file" in joined
+    assert "Privacy & Security" not in joined
+    assert any(cmd[0] == "ffmpeg" for cmd in calls), "the capture must be attempted"
+
+
+def test_probe_reports_authorized_when_the_capture_succeeds(monkeypatch):
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: _FULL_LISTING)
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=True)
+    assert result.mic_authorized is True
+    assert result.detail == []
+
+
+def test_permission_markers_are_only_strings_ffmpeg_actually_emits():
+    """No speculative markers: each one here was seen in a real ffmpeg refusal.
+
+    A marker that never appears can only ever misfire, and markers are tested
+    before the exit code — so an invented one converts clean captures into
+    "macOS denied microphone access". ffmpeg writes "[AVFoundation indev @ 0x…]",
+    never "avfoundation:", so that third string was removed in the fix round.
+    """
+    assert audio._PERMISSION_MARKERS == ("permission denied", "not permitted")
+
+
+@pytest.mark.parametrize("exc", [
+    OSError("ffmpeg is not on PATH"),
+    subprocess.TimeoutExpired(cmd="ffmpeg", timeout=30),
+])
+def test_capture_verdict_explains_a_probe_it_never_ran(monkeypatch, exc):
+    def boom(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    ok, reason = audio._capture_verdict("Omnilingual")
+    assert ok is False
+    assert reason, "an unrun probe must still explain itself"
+    assert "Privacy & Security" not in reason
+    assert "permission" not in reason.lower()
+
+
+def test_probe_survives_a_capture_that_cannot_be_run(monkeypatch):
+    """A 500 on /api/audio is the opaque failure this module exists to prevent."""
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: _FULL_LISTING)
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=True)
+    assert result.mic_authorized is False
+    joined = " ".join(result.detail)
+    assert joined, "the failure must reach the page"
+    assert "Privacy & Security" not in joined
+
+
+def test_restart_daemon_interpolates_nothing_into_the_shell_script(monkeypatch):
+    """A value placed inside the `do shell script` string would be executed as shell."""
+    seen = []
+
+    def fake_run(cmd, **k):
+        seen.append((cmd, k))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    audio.restart_daemon()
+    cmd, kwargs = seen[0]
+    assert cmd[0] == "osascript" and cmd[1] == "-e"
+    assert cmd[2] == 'do shell script "killall coreaudiod" with administrator privileges'
+    assert len(cmd) == 3
+    assert kwargs.get("shell") in (None, False)
+    # A cancelled auth dialog exits nonzero; without check=True that would read
+    # as success and the UI would claim the daemon restarted.
+    assert kwargs.get("check") is True
+
+
+def test_helper_path_compiles_the_swift_helper_once(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, **k):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(audio, "HELPER_SRC", tmp_path / "audio-devices.swift")
+    monkeypatch.setattr(audio, "_helper", None)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    src = tmp_path / "audio-devices.swift"
+    src.write_text("// stub\n", encoding="utf-8")
+    first = audio.helper_path()
+    second = audio.helper_path()
+    assert first == second, "the compiled helper must be cached per process"
+    assert first.parent.is_dir() and first.name == "audio-devices"
+    assert len(calls) == 1
+    assert calls[0][0] == "swiftc"
+    assert str(src) in calls[0]
+
+
+def test_helper_path_refuses_to_build_a_helper_that_is_not_there(monkeypatch, tmp_path):
+    monkeypatch.setattr(audio, "HELPER_SRC", tmp_path / "absent.swift")
+    monkeypatch.setattr(audio, "_helper", None)
+
+    def boom(*a, **k):
+        raise AssertionError("must not compile a missing helper")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(FileNotFoundError):
+        audio.helper_path()
+
+
+def test_device_list_returns_the_helper_stdout(monkeypatch, tmp_path):
+    binary = tmp_path / "audio-devices"
+    monkeypatch.setattr(audio, "helper_path", lambda: binary)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **k: subprocess.CompletedProcess(
+            cmd, 0, stdout="omnilingual.aggregate | Omnilingual\n", stderr=""))
+    assert audio.device_list() == "omnilingual.aggregate | Omnilingual\n"
+
+
+def test_setup_creates_the_aggregate_and_reports_ready(monkeypatch, tmp_path):
+    binary = tmp_path / "audio-devices"
+    calls = []
+
+    def fake_run(cmd, **k):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(audio, "helper_path", lambda: binary)
+    monkeypatch.setattr(audio, "device_list", lambda: "BlackHole_2ch | BlackHole 2ch\n")
+    monkeypatch.setattr(audio.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    lines = list(audio.setup())
+    assert lines[0] == "building the audio-device helper"
+    assert lines[-1] == "Aggregate Device 'Omnilingual' is ready"
+    subcommands = [cmd[1] for cmd in calls if cmd[0] == str(binary)]
+    assert subcommands == ["ensure", "check"], "ensure then verify, nothing else"
+    assert not any(cmd[0] == "SwitchAudioSource" for cmd in calls), (
+        "setup must never route system audio anywhere")
+
+
+def test_setup_reports_a_helper_that_refuses_to_create_the_device(monkeypatch, tmp_path):
+    binary = tmp_path / "audio-devices"
+    monkeypatch.setattr(audio, "helper_path", lambda: binary)
+    monkeypatch.setattr(audio, "device_list", lambda: "BlackHole_2ch | BlackHole 2ch\n")
+    monkeypatch.setattr(audio.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **k: subprocess.CompletedProcess(
+            cmd, 1 if cmd[1:2] == ["ensure"] else 0, stdout="", stderr="no parts"))
+    with pytest.raises(RuntimeError) as ei:
+        list(audio.setup())
+    assert "no parts" in str(ei.value)
+
+
+def test_setup_gives_up_when_blackhole_never_appears(monkeypatch, tmp_path):
+    slept = []
+    monkeypatch.setattr(audio, "helper_path", lambda: tmp_path / "audio-devices")
+    monkeypatch.setattr(audio, "device_list", lambda: "BuiltInMicDevice | Microphone\n")
+    monkeypatch.setattr(audio.time, "sleep", slept.append)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
+    with pytest.raises(RuntimeError) as ei:
+        list(audio.setup())
+    assert "brew install blackhole-2ch" in str(ei.value)
+    assert len(slept) == 30, "bounded retry, not an unbounded hang"
+
+
+def test_setup_refuses_a_device_the_helper_cannot_create(monkeypatch, tmp_path):
+    """The helper hardcodes the name, so any other device would be a false success.
+
+    audio-devices.swift creates and checks only "Omnilingual", so setup("Foo")
+    would create Omnilingual, verify Omnilingual, and then report Foo as ready.
+    """
+    monkeypatch.setattr(audio, "helper_path", lambda: tmp_path / "audio-devices")
+
+    def boom(*a, **k):
+        raise AssertionError("must refuse before touching the helper")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(ValueError) as ei:
+        list(audio.setup("Foo"))
+    assert "Omnilingual" in str(ei.value)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/ui/test_audio.py -q`
-Expected: FAIL — `ImportError: cannot import name 'Readiness' from 'omnilingual.ui.audio'`.
+Expected: FAIL — `ImportError: cannot import name 'audio' from 'omnilingual.ui'` (the module does not exist yet).
 
 - [ ] **Step 3: Write `omnilingual/ui/audio.py`**
+
+> **Authoritative sample, corrected — read this before lifting code from here.** The
+> block below is `omnilingual/ui/audio.py` verbatim as shipped at `302de17` and
+> unchanged since; this document round changed only this sample. An earlier revision
+> was patched on the microphone-probe axis alone, which made the block *partly*
+> correct and therefore more misleading than the originally stale version: a reader
+> who trusted the corrected probe also inherited three defects review had already
+> closed in the shipped module. All three are corrected here:
+>
+> - `setup()` refuses a device the Swift helper cannot create.
+>   `scripts/audio-devices.swift:172` hardcodes `name: "Omnilingual"` and its
+>   `check` (`:206`) tests only `"Omnilingual"` / `"Multi-Output Device"`, so
+>   `setup("Foo")` created Omnilingual, verified Omnilingual, and then reported
+>   `Aggregate Device 'Foo' is ready` — a false success from the one function whose
+>   whole job is to tell the truth.
+> - `setup()` also lost a redundant second `swiftc` compile: `helper_path()` had
+>   already compiled the helper, and the block used to compile it again.
+> - `_current_output()` wraps its `subprocess.run`, like its two sibling call sites.
+>   A hung `SwitchAudioSource` would otherwise turn every `/api/audio` poll into a
+>   500.
+> - `device_list()`'s docstring states the helper's real `"<uid> | <name>"` output
+>   instead of claiming bare names.
+>
+> The microphone-probe corrections from the previous round — the leading-colon
+> `-i ":{device}"`, the two-marker `_PERMISSION_MARKERS`, and the `_capture_verdict`
+> reason split — are unchanged and verified on real hardware. If this block and the
+> shipped module ever disagree, the shipped module wins.
+>
 
 ```python
 """Is audio capture ready, and the two ways to fix it when it is not.
@@ -1253,6 +1641,10 @@ is read-only except setup() and restart_daemon(), which the UI reaches only from
 an explicit button. In particular nothing here ever switches the system output
 device: the Multi-Output Device route silently breaks the volume keys, which is
 why the current output is reported for diagnosis and never changed.
+
+Stdlib plus omnilingual's own ffmpeg gate, deliberately: this package must stay
+importable without the `ui` extra, because the CLI has no web dependency and
+tests/test_ui_packaging.py fails any module here that reaches for one.
 """
 
 from __future__ import annotations
@@ -1265,13 +1657,17 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from omnilingual.audio.normalize import FfmpegMissingError, ensure_ffmpeg
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_SRC = REPO_ROOT / "scripts" / "audio-devices.swift"
 DEVICE_NAME = "Omnilingual"
 _TIMEOUT = 30
 
-# Both seen in real ffmpeg refusals. Markers are tested before the exit code, so a
-# string ffmpeg never emits can only turn a working capture into a denial.
+# How AVFoundation words a refusal, both seen in real ffmpeg output. Markers are
+# tested before the exit code, so a string ffmpeg never emits can only ever turn
+# a working capture into a denial: it spells "[AVFoundation indev @ 0x…]", never
+# "avfoundation:", and that third guess was dropped rather than left to misfire.
 _PERMISSION_MARKERS = ("permission denied", "not permitted")
 
 _helper: Path | None = None
@@ -1293,6 +1689,9 @@ class Readiness:
                     self.mic_authorized))
 
     def as_dict(self) -> dict:
+        # "device" is the name here, while Readiness.device says whether it
+        # exists: the page shows one and colours the other, and renaming either
+        # would break the shape /api/audio already documents.
         return {
             "ok": self.ok,
             "device": DEVICE_NAME,
@@ -1306,7 +1705,11 @@ class Readiness:
 
 
 def helper_path() -> Path:
-    """Compile audio-devices.swift into a private temp binary, once per process."""
+    """Compile audio-devices.swift into a private temp binary, once per process.
+
+    The temp directory is deliberately left behind: the binary is the process's
+    working copy of the helper for as long as the UI runs.
+    """
     global _helper
     if _helper is not None:
         return _helper
@@ -1331,10 +1734,19 @@ def device_list() -> str:
 
 
 def _current_output() -> str | None:
+    """The device the system plays through right now — reported, never changed.
+
+    Best-effort by design: this is a diagnostic for "why is meeting audio not
+    reaching BlackHole", so an absent or stuck SwitchAudioSource must not fail
+    the readiness verdict the page is waiting on.
+    """
     if shutil.which("SwitchAudioSource") is None:
         return None
-    result = subprocess.run(["SwitchAudioSource", "-c"], capture_output=True,
-                            text=True, timeout=_TIMEOUT)
+    try:
+        result = subprocess.run(["SwitchAudioSource", "-c"], capture_output=True,
+                                text=True, timeout=_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
     return (result.stdout or "").strip() or None
 
 
@@ -1347,10 +1759,21 @@ def _short_error(text: str) -> str:
 def _capture_verdict(device: str) -> tuple[bool, str]:
     """Attempt one second of capture and report what actually happened.
 
-    The leading colon selects the audio section, which is the form
-    live_capture.py opens capture with — see the note below this block. Returns
-    (authorized, reason); `reason` is empty when authorized, so the caller can
-    name a permission denial only when one was actually observed.
+    macOS exposes no supported way to read Microphone TCC status, so this is the
+    only way to learn it. It works because capture runs through ffmpeg in this
+    process rather than the browser's getUserMedia: there is no browser prompt,
+    but macOS still refuses at the AVFoundation layer.
+
+    The leading colon in the device string selects the audio section, which is
+    the form live_capture.py opens capture with: a bare `-i Omnilingual` asks
+    avfoundation for a *video* device of that name and fails "Video device not
+    found", which says nothing about the microphone.
+
+    Returns (authorized, reason). `reason` explains a failure and is empty when
+    authorized, so the caller can name a permission denial only when one was
+    actually observed. A probe that could not be run is also a failure with a
+    reason, never a denial: the only subprocess call here that touches hardware,
+    and the one most able to hang.
     """
     try:
         result = subprocess.run(
@@ -1370,20 +1793,12 @@ def _capture_verdict(device: str) -> tuple[bool, str]:
 
 
 def _mic_authorized(device: str) -> bool:
-    """Empirically test whether this process may record."""
+    """Empirically test whether this process may record.
+
+    Real audio I/O for one second, which is why probe() takes mic=False: a page
+    poll that cannot ask must not make noise.
+    """
     return _capture_verdict(device)[0]
-
-
-# NOTE (task 5 fix round) — the device string above carries a leading colon for
-# a reason found by running it: avfoundation parses its device argument as
-# `[video][:audio]`, so a bare `-i Omnilingual` asks for a *video* device of that
-# name and exits 251 with "Video device not found" — on a machine whose Aggregate
-# Device exists and whose microphone is authorised and working. That turns every
-# capture into a failure and, with the old unconditional-denial message, into a
-# false "microphone access denied". Verified: `-i ":Omnilingual"` exits 0, and
-# omnilingual/audio/live_capture.py:91 opens capture the same way. The
-# "avfoundation:" marker is gone for the same reason — ffmpeg writes
-# "[AVFoundation indev @ 0x…]", never "avfoundation:".
 
 
 def probe(device: str = DEVICE_NAME, *, mic: bool = True) -> Readiness:
@@ -1392,10 +1807,13 @@ def probe(device: str = DEVICE_NAME, *, mic: bool = True) -> Readiness:
     ffmpeg = shutil.which("ffmpeg") is not None
     ffprobe = shutil.which("ffprobe") is not None
     if not (ffmpeg and ffprobe):
-        missing = [tool for tool, present in (("ffmpeg", ffmpeg),
-                                              ("ffprobe", ffprobe)) if not present]
-        detail.append(f"{' and '.join(missing)} not on PATH; "
-                      "run: brew install ffmpeg")
+        # ensure_ffmpeg owns the wording of this failure for the CLI, so borrow
+        # its message instead of keeping a second one to drift. probe reports
+        # where the CLI raises, which is why it cannot simply call the gate.
+        try:
+            ensure_ffmpeg()
+        except FfmpegMissingError as exc:
+            detail.append(str(exc))
 
     listing = ""
     if ffmpeg and ffprobe:
@@ -1427,10 +1845,14 @@ def probe(device: str = DEVICE_NAME, *, mic: bool = True) -> Readiness:
 
 def setup(device: str = DEVICE_NAME) -> Iterator[str]:
     """Create the Aggregate Device, yielding progress lines. Idempotent."""
-    binary = helper_path()
+    # audio-devices.swift hardcodes the name in both `ensure` and `check`, so any
+    # other name would be created as Omnilingual, verified as Omnilingual, and
+    # then reported as ready under the caller's name — a false success from the
+    # one function whose whole job is to tell the truth.
+    if device != DEVICE_NAME:
+        raise ValueError(f"the helper only creates {DEVICE_NAME!r}")
     yield "building the audio-device helper"
-    subprocess.run(["swiftc", "-o", str(binary), str(HELPER_SRC)], check=True,
-                   capture_output=True, timeout=_TIMEOUT)
+    binary = helper_path()
 
     for attempt in range(30):
         try:
@@ -1463,6 +1885,9 @@ def restart_daemon() -> None:
 
     The UI has no TTY, so setup-mac.sh takes its no-sudo branch and skips this; a
     freshly installed BlackHole does not appear until coreaudiod restarts.
+
+    The script string is a constant: anything interpolated between those quotes
+    would be executed as shell by root. Nothing from a request reaches it.
     """
     subprocess.run(
         ["osascript", "-e",
@@ -1473,12 +1898,12 @@ def restart_daemon() -> None:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/ui/test_audio.py -q`
-Expected: PASS (10 tests).
+Expected: PASS (34 tests).
 
 - [ ] **Step 5: Verify the real probe on this machine**
 
 Run: `uv run python -c "import json; from omnilingual.ui import audio; print(json.dumps(audio.probe().as_dict(), indent=2))"`
-Expected: a JSON object with all seven keys. Whether `ok` is true depends on whether this machine has the Aggregate Device configured; the point of the check is that the call returns a verdict instead of raising.
+Expected: a JSON object with all eight keys. Whether `ok` is true depends on whether this machine has the Aggregate Device configured; the point of the check is that the call returns a verdict instead of raising.
 
 - [ ] **Step 6: Commit**
 
