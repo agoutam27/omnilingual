@@ -1,0 +1,116 @@
+"""Run preferences for the UI, persisted outside the repo.
+
+Deliberately separate from the repo's .env (see secrets.py) and from the CLI:
+phase 1 does not make the CLI read this file. It lives beside setup-mac.conf
+with the same permissions, so a preferences file is never group- or
+world-readable.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import tempfile
+import tomllib
+from pathlib import Path
+
+# One entry per control in the spec's parameter table. The numeric and provider
+# defaults match the CLI's own, so the panel opens on the configuration the
+# command line would have used; the ones the CLI derives at runtime (out, langs,
+# num_speakers, work_dir) carry the panel's own opening values instead.
+DEFAULTS: dict[str, object] = {
+    "mode": "live",
+    "source": "",
+    "out": "standup.md",
+    "stt": "sarvam",
+    "stt_model": "",
+    "mt": "mayura",
+    "mt_model": "",
+    "diarize": False,
+    "num_speakers": 3,
+    "langs": [],
+    "english_only": False,
+    "work_dir": "",
+    "device": "Omnilingual",
+    "mic_only": False,
+    "target_s": 8.0,
+    "max_chunk_s": 28.0,
+    "min_chunk_s": 5.0,
+    "noise_db": -35.0,
+    "stt_workers": 2,
+    "max_cost": 50.0,
+}
+
+
+def config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "omnilingual"
+
+
+def settings_path() -> Path:
+    return config_dir() / "ui.toml"
+
+
+def load() -> dict[str, object]:
+    """Return the defaults merged under the stored file.
+
+    Never raises: an unreadable or corrupt store must not stop the app from
+    opening, so the user just gets defaults and can re-save over the damage.
+    """
+    values = dict(DEFAULTS)
+    try:
+        stored = tomllib.loads(settings_path().read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return values
+    for key, value in stored.items():
+        if key in DEFAULTS:  # ignore junk keys rather than importing them
+            values[key] = value
+    return values
+
+
+def _fmt(key: str, value: object) -> str:
+    if isinstance(value, bool):
+        return f"{key} = {'true' if value else 'false'}"
+    if isinstance(value, (int, float)):
+        return f"{key} = {value!r}"
+    # json.dumps, not repr: repr of a value holding both quote characters emits
+    # a Python literal ('it\'s "q".md'), and TOML reads that as a *literal*
+    # string where a backslash means nothing — tomllib rejects the file and
+    # load() silently discards every setting. JSON escapes are always valid TOML.
+    if isinstance(value, list):
+        return f"{key} = {json.dumps([str(v) for v in value], ensure_ascii=False)}"
+    return f"{key} = {json.dumps(str(value), ensure_ascii=False)}"
+
+
+def save(values) -> dict[str, object]:
+    """Validate and persist atomically. Returns the stored state.
+
+    Validation is by rejection, not coercion: an unknown key is almost always a
+    renamed control, and silently dropping it would look like the UI forgot the
+    setting.
+    """
+    unknown = sorted(set(values) - set(DEFAULTS))
+    if unknown:
+        raise ValueError(f"unknown setting(s): {', '.join(unknown)}")
+    merged = load()
+    merged.update(values)
+
+    directory = config_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, stat.S_IRWXU)
+
+    body = "\n".join(_fmt(key, merged[key]) for key in DEFAULTS) + "\n"
+
+    # Write a sibling, then rename: a crash mid-write must not leave a
+    # truncated store that load() would silently discard.
+    handle, tmp = tempfile.mkstemp(dir=str(directory), prefix="ui-", suffix=".toml")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp, settings_path())
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    return merged
