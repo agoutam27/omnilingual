@@ -172,17 +172,21 @@ def build_run(
     and no way out but force-quitting the app. Raising ConfigError here turns that
     into the 400 it should always have been.
 
-    Every failure this raises is a ConfigError, deliberately including an unknown
-    field: the server answers 400, and a second exception type would turn a
-    renamed control into a 500.
+    Every failure this raises is a ConfigError, without exception: an unknown
+    field, a numeric field that will not coerce, and every shared validator's own
+    complaint alike. The server answers 400, so one except clause has to be enough
+    — a second type turns a bad start request into a 500, which is the one thing
+    the page cannot explain to the user. The numeric wrapper exists because a JSON
+    body is not trustworthy the way a typed CLI argument is: it arrives as text, or
+    as null for a field the user cleared, and float(None) is a TypeError the spec
+    never mentions.
     """
     unknown = sorted(set(values) - _PANEL_FIELDS)
     if unknown:
         raise ConfigError(f"unknown run field(s): {', '.join(unknown)}")
     mode = str(values.get("mode", "live"))
-    min_chunk_s = float(values.get("min_chunk_s", 5.0))
-    max_chunk_s = float(values.get("max_chunk_s", 28.0))
-    speakers = values.get("num_speakers")
+    min_chunk_s = _numeric(values, "min_chunk_s", 5.0)
+    max_chunk_s = _numeric(values, "max_chunk_s", 28.0)
     settings = load_settings(
         env=run_env(env),
         langs=list(values.get("langs") or []),
@@ -195,16 +199,44 @@ def build_run(
         mt_provider=str(values.get("mt", "mayura")),
         mt_model=str(values.get("mt_model") or "") or None,
         diarizer="sherpa" if values.get("diarize") else None,
-        num_speakers=int(speakers) if speakers is not None else None,
+        num_speakers=_numeric(values, "num_speakers", None, as_int=True),
     )
     # Before the providers exist, so an out-of-bounds panel costs nothing and
     # cannot surface as a wall of 400 s from the API. Same order as cli.py:live.
     validate_chunk_bounds(min_chunk_s, max_chunk_s)
     if mode == "live":
-        validate_target_s(float(values.get("target_s", 8.0)), min_chunk_s, max_chunk_s)
+        validate_target_s(_numeric(values, "target_s", 8.0),
+                          min_chunk_s, max_chunk_s)
     require_keys(settings)
     return (settings, build_stt(settings), build_translator(settings),
             build_diarizer(settings) if settings.diarizer else None)
+
+
+def _numeric(values: Mapping[str, object], field: str, default,
+             *, as_int: bool = False):
+    """One panel field as a number, or a ConfigError naming the field.
+
+    A JSON body is not shaped like a typed CLI argument: it carries text where the
+    CLI carries numbers, and a field the user cleared arrives as null or as an
+    empty string. float()/int() alone would leak ValueError for "abc" and
+    TypeError for None, and the spec's 400 path cannot catch either.
+
+    Absent, null and blank all mean "not provided" and fall back to the field's
+    default, which is the same truthiness reading config.load_settings applies when
+    it turns env.get(...) into a key or None. Anything else is a mistake worth
+    naming, so the message says which field and what arrived: the user is looking
+    at a form, not at a traceback.
+    """
+    raw = values.get(field)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    try:
+        return int(raw) if as_int else float(raw)
+    except (TypeError, ValueError) as exc:
+        kind = "a whole number" if as_int else "a number"
+        raise ConfigError(
+            f"--{field.replace('_', '-')} must be {kind} (got {raw!r})"
+        ) from exc
 
 
 def live_options(
@@ -234,12 +266,12 @@ def live_options(
         out=out,
         device=str(values.get("device") or "Omnilingual"),
         mic_only=bool(values.get("mic_only")),
-        target_s=float(values.get("target_s", 8.0)),
-        max_chunk_s=float(values.get("max_chunk_s", 28.0)),
-        min_chunk_s=float(values.get("min_chunk_s", 5.0)),
-        noise_db=float(values.get("noise_db", -35.0)),
-        stt_workers=int(values.get("stt_workers", 2)),
-        max_cost=float(values.get("max_cost", 50.0)),
+        target_s=_numeric(values, "target_s", 8.0),
+        max_chunk_s=_numeric(values, "max_chunk_s", 28.0),
+        min_chunk_s=_numeric(values, "min_chunk_s", 5.0),
+        noise_db=_numeric(values, "noise_db", -35.0),
+        stt_workers=_numeric(values, "stt_workers", 2, as_int=True),
+        max_cost=_numeric(values, "max_cost", 50.0),
         work_root=root,
         english_only=bool(values.get("english_only")),
     )
@@ -368,12 +400,16 @@ class SessionRunner:
         self._cost_cap = opts.max_cost
         # Before the thread starts and before the caller reads _out, so the path
         # the start request reports is the path the run actually writes.
-        out = free_output_path(opts.out)
-        if out != opts.out:
+        requested = opts.out
+        out = free_output_path(requested)
+        if out != requested:
+            # Name the file that was in the way and the one being written instead.
+            # Rebinding opts first would print the new name twice and hide the
+            # fact that the filename the user chose was taken.
             opts = replace(opts, out=out)
             self._emit({"type": "log", "level": "warn",
-                        "message": f"{opts.out.name} exists; writing "
-                                   f"{out.name} instead"})
+                        "message": f"{requested.name} already exists; "
+                                   f"writing {out.name} instead"})
         self._out = out
         self._spawn(self._live, settings, stt, translator, diarizer, opts,
                     capture_factory)
@@ -638,7 +674,8 @@ class SessionRunner:
 
 
 # ConfigError is re-exported so a caller turning a bad start request into a 400
-# catches one exception type: build_run raises nothing else.
+# catches one exception type: build_run, live_options and free_output_path
+# raise ConfigError and nothing else, so one except clause is the whole 400 path.
 __all__ = [
     "ConfigError",
     "SessionRunner",

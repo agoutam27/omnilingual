@@ -828,7 +828,16 @@ def test_a_second_live_run_to_the_same_path_renames_instead_of_failing(respx_moc
     # The start request answers with the path actually written, so the page links
     # to the new file rather than the one that was left alone.
     assert queue.of("end")[0]["out"] == str(paths[1])
-    assert any("writing" in m["message"] for m in queue.of("log"))
+    # The warning must name BOTH: the file that was in the way, and the one being
+    # written. Naming the new name twice ("standup-2132.md exists; writing
+    # standup-2132.md instead") is nonsense and hides the fact that the filename
+    # the user chose was taken.
+    warning = next(m["message"] for m in queue.of("log")
+                   if "instead" in m["message"])
+    assert warning == (f"{out.name} already exists; writing {paths[1].name} "
+                       f"instead")
+    assert out.name != paths[1].name
+    assert "· growing" not in paths[1].read_text(encoding="utf-8")
 
 
 def test_free_output_path_only_renames_on_a_collision(tmp_path):
@@ -942,25 +951,34 @@ def test_stop_does_not_claim_to_stop_a_batch_run(respx_mock, tmp_path):
     assert (tmp_path / "batch.md").is_file()
 
 
-def test_stop_before_start_does_not_poison_the_next_run(tmp_path):
+@respx.mock
+def test_stop_before_start_does_not_poison_the_next_run(respx_mock, tmp_path):
     """A stop that arrived while the runner was idle belongs to nothing. Carrying
-    it into a run makes that run stop on its first read, so a runner stopped while
-    idle and then started looks broken."""
+    it into a run makes that run stop on its first read.
+
+    This has to be driven through start_live: the batch loop takes no stop channel,
+    so a recording run cannot observe the flag at all and the test would pass with
+    the fix deleted. On a live run the difference is a run that reports "done" and
+    writes a transcript with nothing in it.
+    """
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
     config, stt, mt = _providers()
     runner = SessionRunner(run_id="r-poison", queue=Collector())
-    runner.stop()
+    runner.stop()  # stray stop, while the runner is still idle
 
-    runner.start_recording(settings=config, stt=stt, translator=mt, diarizer=None,
-                           source=tmp_path / "nope.wav",
-                           work_root=tmp_path / "work",
-                           out=tmp_path / "after.md")
-    runner.join(timeout=60)
+    opts = LiveOptions(out=tmp_path / "meeting.md", stt_workers=1)
+    runner.start_live(settings=config, stt=stt, translator=mt, diarizer=None,
+                      opts=opts, capture_factory=factory)
+    runner.join(timeout=120)
 
-    # The run ran to its own conclusion rather than being cut short: a poisoned
-    # flag would have shown up as a run that never even reached its input file.
-    assert runner.status == "failed"
-    assert runner.out_path == tmp_path / "after.md"
-    assert any("nope.wav" in m["message"] for m in runner._queue.of("log"))
+    assert runner.status == "done"
+    segments = runner._queue.of("segment")
+    assert len(segments) >= 1, (
+        "a poisoned stop flag makes a live run report 'done' with zero segments, "
+        "which is a meeting that recorded nothing")
+    assert "Bravo" in (tmp_path / "meeting.md").read_text(encoding="utf-8")
 
 
 # --- the english-only sibling, on a real path -----------------------------
@@ -1096,3 +1114,80 @@ def test_recover_reports_a_directory_that_is_not_a_live_session(tmp_path):
     assert any("live session" in m["message"] for m in queue.of("log"))
     assert not (tmp_path / "recovered.md").exists()
     assert queue.of("state")[-1]["error"]
+
+
+# --- every validation failure is one exception type -----------------------
+
+
+@pytest.mark.parametrize("override,field", [
+    ({"max_chunk_s": "abc"}, "max-chunk-s"),
+    ({"min_chunk_s": "abc"}, "min-chunk-s"),
+    ({"target_s": "eight"}, "target-s"),
+    ({"num_speakers": "three"}, "num-speakers"),
+    ({"num_speakers": [3]}, "num-speakers"),
+    ({"max_chunk_s": {"v": 28}}, "max-chunk-s"),
+])
+def test_a_numeric_field_that_will_not_coerce_is_a_configerror(override, field,
+                                                               tmp_path, monkeypatch):
+    """float("abc") is a ValueError and float({"v": 28}) is a TypeError, and the
+    spec's 400 path can only catch ConfigError. One except clause has to be enough,
+    so every way a payload can be malformed lands on the same type — and names the
+    field, because the user is looking at a form.
+
+    null and blank are not here: they mean "not provided" and fall back to the
+    field's default, which the test below covers."""
+    _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SARVAM_API_KEY", "k")
+    panel = {"mode": "live", "stt": "sarvam", "mt": "mayura", "langs": [],
+             "target_s": 8.0, "max_chunk_s": 28.0, "min_chunk_s": 5.0}
+    panel.update(override)
+
+    with pytest.raises(ConfigError, match=field):
+        build_run(panel)
+
+
+@pytest.mark.parametrize("override,field", [
+    ({"target_s": "eight"}, "target-s"),
+    ({"max_chunk_s": "abc"}, "max-chunk-s"),
+    ({"noise_db": "loud"}, "noise-db"),
+    ({"stt_workers": "many"}, "stt-workers"),
+    ({"max_cost": "lots"}, "max-cost"),
+])
+def test_live_options_rejects_a_bad_number_the_same_way(override, field, tmp_path):
+    """live_options reads a superset of build_run's fields, so it needs the same
+    wrapper: stt_workers, noise_db and max_cost never reach build_run at all, and a
+    ConfigError from live_options must still be the server's single 400."""
+    with pytest.raises(ConfigError, match=field):
+        live_options(override, out=tmp_path / "x.md")
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_a_cleared_numeric_field_falls_back_to_its_default(blank, tmp_path, monkeypatch):
+    """Absent, null and blank all mean "not provided". Rejecting them would fail
+    the request for a form the user merely cleared, and propagating None would hand
+    run_live a None where it does max(1, opts.stt_workers)."""
+    _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SARVAM_API_KEY", "k")
+    panel = {"mode": "live", "stt": "sarvam", "mt": "mayura", "langs": [],
+             "max_chunk_s": blank, "min_chunk_s": 5.0, "target_s": 8.0}
+
+    settings, *_ = build_run(panel)
+    assert settings.max_chunk_s == 28.0
+    opts = live_options({"stt_workers": blank, "noise_db": blank}, out=tmp_path / "y.md")
+    assert opts.stt_workers == 2, "the CLI's default, not None and not 1"
+    assert opts.noise_db == -35.0
+
+
+def test_num_speakers_absent_still_means_auto_count(tmp_path, monkeypatch):
+    # The one field whose absence is meaningful rather than a fallback: leaving the
+    # speaker count out has always meant "let the diarizer decide", and only
+    # load_settings decides whether a count is legal.
+    _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SARVAM_API_KEY", "k")
+
+    settings, *_ = build_run({"mode": "recording", "stt": "sarvam",
+                              "mt": "mayura", "langs": []})
+    assert settings.num_speakers is None
+    with pytest.raises(ConfigError):
+        build_run({"mode": "recording", "stt": "sarvam", "mt": "mayura",
+                   "langs": [], "num_speakers": 1})
