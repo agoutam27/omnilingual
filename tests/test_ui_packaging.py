@@ -170,23 +170,63 @@ def test_ui_package_is_a_real_module_not_namespace():
     )
 
 
-def test_ui_package_has_no_web_imports():
-    """Assert no module in omnilingual/ui/ imports fastapi, uvicorn or pywebview.
+def test_ui_package_has_no_web_imports_outside_the_allowed_files():
+    """Assert no module in omnilingual/ui/ imports fastapi, uvicorn or pywebview
+    outside the one file that is allowed to.
 
     Scans the whole package rather than just the initializer: `ui.toml` settings
     and `.env` handling are stdlib-only precisely so they stay importable without
     the extra, and a web import in either would put the CLI back on that path.
+
+    The exemptions are per dependency, not a blanket skip of one file. Each web
+    library has exactly one legal home — fastapi in server.py, uvicorn and
+    pywebview in __main__.py — so a stray import of a *different* library in one of
+    those files still fails here. __main__.py does not exist yet (it lands with the
+    launcher); the allowance is written down so the launcher cannot be written
+    against a rule it has to argue with.
     """
     ui_dir = Path(__file__).resolve().parents[1] / "omnilingual" / "ui"
+    allowed = {"server.py": {"fastapi"},
+               "__main__.py": {"uvicorn", "pywebview"}}
     modules = sorted(ui_dir.glob("*.py"))
     assert modules, f"no modules found in {ui_dir}"
     for path in modules:
+        permitted = allowed.get(path.name, set())
         source = path.read_text(encoding="utf-8")
         for lib in ("fastapi", "uvicorn", "pywebview"):
+            if lib in permitted:
+                continue
             # Check both bare `import` and `from ... import` forms
             assert f"import {lib}" not in source, (
-                f"{lib} imported in omnilingual/ui/{path.name} — should not be there"
+                f"{lib} imported in omnilingual/ui/{path.name} — only "
+                f"{sorted(permitted) or 'no ui module'} may import it"
             )
             assert f"from {lib}" not in source, (
-                f"{lib} from-import in omnilingual/ui/{path.name} — should not be there"
+                f"{lib} from-import in omnilingual/ui/{path.name} — only "
+                f"{sorted(permitted) or 'no ui module'} may import it"
             )
+
+
+def test_the_web_dependency_exemptions_are_the_only_ones():
+    """server.py's exemption must not quietly widen: nothing else may claim fastapi."""
+    source = (Path(__file__).resolve().parents[1] / "omnilingual" / "ui"
+              / "server.py").read_text(encoding="utf-8")
+    assert ("import fastapi" in source or "from fastapi" in source), (
+        "the server must actually be the app")
+    for lib in ("uvicorn", "pywebview"):
+        assert f"import {lib}" not in source, (
+            f"{lib} belongs to __main__.py, not the ASGI app")
+
+
+def test_server_does_not_import_the_pipeline():
+    """session.py is the only ui module allowed to know how a run executes.
+
+    Enforced here as well as in tests/ui/test_server.py because this file is the
+    one that reads every module's source: the pipeline is a heavy internal package
+    and the web layer's contract is that it reaches a run only through session.
+    """
+    server = (Path(__file__).resolve().parents[1] / "omnilingual" / "ui"
+              / "server.py")
+    source = server.read_text(encoding="utf-8")
+    assert "omnilingual.pipeline" not in source, (
+        "server.py must go through omnilingual.ui.session, not the pipeline")
