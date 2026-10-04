@@ -165,6 +165,33 @@ def test_probe_reports_the_missing_device_and_blackhole(monkeypatch, no_sudo):
     joined = " ".join(result.detail)
     assert "Omnilingual" in joined
     assert "brew install blackhole-2ch" in joined
+    assert result.mic_authorized is True and not any(
+        "microphone" in line.lower() for line in result.detail)
+
+
+def test_probe_reports_the_mic_as_authorized_when_the_probe_is_skipped(monkeypatch):
+    """mic=False means "not asked", so the answer must not be a false alarm.
+
+    Task 6 returns probe(mic=False) from both fix endpoints, so flipping the
+    unprobed branch to False would put "microphone access denied" in the banner
+    of every *successful* setup while this suite stayed green.
+    """
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: _FULL_LISTING)
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=False)
+    assert result.mic_authorized is True
+    assert not any("microphone" in line.lower() for line in result.detail)
+
+
+def test_probe_keeps_the_skipped_mic_authorized_even_with_no_device(monkeypatch, no_sudo):
+    """Unprobed outranks "device missing": the branch order must not hide it."""
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: "")
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=False)
+    assert result.device is False
+    assert result.mic_authorized is True
 
 
 def test_probe_survives_a_helper_that_cannot_be_compiled(monkeypatch, no_sudo):
@@ -255,6 +282,49 @@ def test_probe_reports_authorized_when_the_capture_succeeds(monkeypatch):
     result = audio.probe(device="Omnilingual", mic=True)
     assert result.mic_authorized is True
     assert result.detail == []
+
+
+def test_permission_markers_are_only_strings_ffmpeg_actually_emits():
+    """No speculative markers: each one here was seen in a real ffmpeg refusal.
+
+    A marker that never appears can only ever misfire, and markers are tested
+    before the exit code — so an invented one converts clean captures into
+    "macOS denied microphone access". ffmpeg writes "[AVFoundation indev @ 0x…]",
+    never "avfoundation:", so that third string was removed in the fix round.
+    """
+    assert audio._PERMISSION_MARKERS == ("permission denied", "not permitted")
+
+
+@pytest.mark.parametrize("exc", [
+    OSError("ffmpeg is not on PATH"),
+    subprocess.TimeoutExpired(cmd="ffmpeg", timeout=30),
+])
+def test_capture_verdict_explains_a_probe_it_never_ran(monkeypatch, exc):
+    def boom(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    ok, reason = audio._capture_verdict("Omnilingual")
+    assert ok is False
+    assert reason, "an unrun probe must still explain itself"
+    assert "Privacy & Security" not in reason
+    assert "permission" not in reason.lower()
+
+
+def test_probe_survives_a_capture_that_cannot_be_run(monkeypatch):
+    """A 500 on /api/audio is the opaque failure this module exists to prevent."""
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(audio, "device_list", lambda: _FULL_LISTING)
+    monkeypatch.setattr(audio, "_current_output", lambda: "Speakers")
+    result = audio.probe(device="Omnilingual", mic=True)
+    assert result.mic_authorized is False
+    joined = " ".join(result.detail)
+    assert joined, "the failure must reach the page"
+    assert "Privacy & Security" not in joined
 
 
 def test_restart_daemon_interpolates_nothing_into_the_shell_script(monkeypatch):
@@ -367,3 +437,20 @@ def test_setup_gives_up_when_blackhole_never_appears(monkeypatch, tmp_path):
         list(audio.setup())
     assert "brew install blackhole-2ch" in str(ei.value)
     assert len(slept) == 30, "bounded retry, not an unbounded hang"
+
+
+def test_setup_refuses_a_device_the_helper_cannot_create(monkeypatch, tmp_path):
+    """The helper hardcodes the name, so any other device would be a false success.
+
+    audio-devices.swift creates and checks only "Omnilingual", so setup("Foo")
+    would create Omnilingual, verify Omnilingual, and then report Foo as ready.
+    """
+    monkeypatch.setattr(audio, "helper_path", lambda: tmp_path / "audio-devices")
+
+    def boom(*a, **k):
+        raise AssertionError("must refuse before touching the helper")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(ValueError) as ei:
+        list(audio.setup("Foo"))
+    assert "Omnilingual" in str(ei.value)

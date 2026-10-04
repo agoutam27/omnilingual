@@ -1270,6 +1270,10 @@ HELPER_SRC = REPO_ROOT / "scripts" / "audio-devices.swift"
 DEVICE_NAME = "Omnilingual"
 _TIMEOUT = 30
 
+# Both seen in real ffmpeg refusals. Markers are tested before the exit code, so a
+# string ffmpeg never emits can only turn a working capture into a denial.
+_PERMISSION_MARKERS = ("permission denied", "not permitted")
+
 _helper: Path | None = None
 
 
@@ -1316,7 +1320,11 @@ def helper_path() -> Path:
 
 
 def device_list() -> str:
-    """Stdout of the helper's `list` subcommand: device names, one per line."""
+    """Stdout of the helper's `list` subcommand.
+
+    One `"<uid> | <name>"` line per audio device, so callers match a device by
+    substring against the whole listing rather than parsing a column.
+    """
     result = subprocess.run([str(helper_path()), "list"], capture_output=True,
                             text=True, timeout=_TIMEOUT)
     return result.stdout or ""
@@ -1330,23 +1338,52 @@ def _current_output() -> str | None:
     return (result.stdout or "").strip() or None
 
 
-def _mic_authorized(device: str) -> bool:
-    """Empirically test whether this process may record.
+def _short_error(text: str) -> str:
+    """The last thing ffmpeg said, trimmed to something a page can show."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1][:200] if lines else "ffmpeg failed without a message"
 
-    macOS exposes no supported way to read Microphone TCC status, so a one-second
-    capture is attempted and the failure is read. This works because capture runs
-    through ffmpeg in this process rather than the browser's getUserMedia: there
-    is no browser prompt, but macOS still refuses at the AVFoundation layer.
+
+def _capture_verdict(device: str) -> tuple[bool, str]:
+    """Attempt one second of capture and report what actually happened.
+
+    The leading colon selects the audio section, which is the form
+    live_capture.py opens capture with — see the note below this block. Returns
+    (authorized, reason); `reason` is empty when authorized, so the caller can
+    name a permission denial only when one was actually observed.
     """
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-i", device,
-         "-t", "1", "-f", "null", "-"],
-        capture_output=True, text=True, timeout=_TIMEOUT)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-f", "avfoundation",
+             "-i", f":{device}", "-t", "1", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, _short_error(f"could not run the one-second capture: {exc}")
+    stderr = result.stderr or ""
+    if any(marker in stderr.lower() for marker in _PERMISSION_MARKERS):
+        return False, ("macOS denied microphone access — approve this app in "
+                       "System Settings → Privacy & Security → Microphone")
     if result.returncode != 0:
-        return False
-    blob = ((result.stderr or "") + (result.stdout or "")).lower()
-    return not any(marker in blob for marker in
-                   ("permission denied", "not permitted", "avfoundation:"))
+        # Not a denial: a busy device or a broken aggregate fails the same way.
+        return False, _short_error(stderr + (result.stdout or ""))
+    return True, ""
+
+
+def _mic_authorized(device: str) -> bool:
+    """Empirically test whether this process may record."""
+    return _capture_verdict(device)[0]
+
+
+# NOTE (task 5 fix round) — the device string above carries a leading colon for
+# a reason found by running it: avfoundation parses its device argument as
+# `[video][:audio]`, so a bare `-i Omnilingual` asks for a *video* device of that
+# name and exits 251 with "Video device not found" — on a machine whose Aggregate
+# Device exists and whose microphone is authorised and working. That turns every
+# capture into a failure and, with the old unconditional-denial message, into a
+# false "microphone access denied". Verified: `-i ":Omnilingual"` exits 0, and
+# omnilingual/audio/live_capture.py:91 opens capture the same way. The
+# "avfoundation:" marker is gone for the same reason — ffmpeg writes
+# "[AVFoundation indev @ 0x…]", never "avfoundation:".
 
 
 def probe(device: str = DEVICE_NAME, *, mic: bool = True) -> Readiness:
@@ -1379,10 +1416,9 @@ def probe(device: str = DEVICE_NAME, *, mic: bool = True) -> Readiness:
     if not mic:
         mic_ok = True  # not probed, so do not report a false alarm
     elif ffmpeg and device_ok:
-        mic_ok = _mic_authorized(device)
+        mic_ok, reason = _capture_verdict(device)
         if not mic_ok:
-            detail.append("microphone access denied; approve this app in System "
-                          "Settings → Privacy & Security → Microphone")
+            detail.append(f"microphone capture failed: {reason}")
 
     return Readiness(device=device_ok, blackhole=blackhole, ffmpeg=ffmpeg,
                      ffprobe=ffprobe, mic_authorized=mic_ok,

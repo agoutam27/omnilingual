@@ -29,10 +29,11 @@ HELPER_SRC = REPO_ROOT / "scripts" / "audio-devices.swift"
 DEVICE_NAME = "Omnilingual"
 _TIMEOUT = 30
 
-# How AVFoundation words a refusal. Matched case-insensitively against ffmpeg's
-# stderr, because it has been seen both as "Permission denied" and as
-# "Device not permitted".
-_PERMISSION_MARKERS = ("permission denied", "not permitted", "avfoundation:")
+# How AVFoundation words a refusal, both seen in real ffmpeg output. Markers are
+# tested before the exit code, so a string ffmpeg never emits can only ever turn
+# a working capture into a denial: it spells "[AVFoundation indev @ 0x…]", never
+# "avfoundation:", and that third guess was dropped rather than left to misfire.
+_PERMISSION_MARKERS = ("permission denied", "not permitted")
 
 _helper: Path | None = None
 
@@ -135,12 +136,17 @@ def _capture_verdict(device: str) -> tuple[bool, str]:
 
     Returns (authorized, reason). `reason` explains a failure and is empty when
     authorized, so the caller can name a permission denial only when one was
-    actually observed.
+    actually observed. A probe that could not be run is also a failure with a
+    reason, never a denial: the only subprocess call here that touches hardware,
+    and the one most able to hang.
     """
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostdin", "-f", "avfoundation",
-         "-i", f":{device}", "-t", "1", "-f", "null", "-"],
-        capture_output=True, text=True, timeout=_TIMEOUT)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-f", "avfoundation",
+             "-i", f":{device}", "-t", "1", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, _short_error(f"could not run the one-second capture: {exc}")
     stderr = result.stderr or ""
     if any(marker in stderr.lower() for marker in _PERMISSION_MARKERS):
         return False, ("macOS denied microphone access — approve this app in "
@@ -204,6 +210,12 @@ def probe(device: str = DEVICE_NAME, *, mic: bool = True) -> Readiness:
 
 def setup(device: str = DEVICE_NAME) -> Iterator[str]:
     """Create the Aggregate Device, yielding progress lines. Idempotent."""
+    # audio-devices.swift hardcodes the name in both `ensure` and `check`, so any
+    # other name would be created as Omnilingual, verified as Omnilingual, and
+    # then reported as ready under the caller's name — a false success from the
+    # one function whose whole job is to tell the truth.
+    if device != DEVICE_NAME:
+        raise ValueError(f"the helper only creates {DEVICE_NAME!r}")
     yield "building the audio-device helper"
     binary = helper_path()
 
