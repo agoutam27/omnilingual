@@ -145,6 +145,27 @@ def load_settings(
     return settings
 
 
+def require_keys(settings: Settings) -> None:
+    """Raise ConfigError unless the credentials the chosen backends need are present.
+
+    Lives here, beside the validators and for the same reason: *which* key a run
+    needs is a property of the providers it selected, so a second copy of that
+    dispatch in the UI would drift the moment a provider was added. Every check
+    itself is a public method on Settings — this only chooses between them.
+
+    Only the keys the selected backends actually use are demanded, so
+    `--stt groq --mt gemini` runs on the free tiers with no Sarvam account. Call
+    it before starting a run, not from inside one: the providers read their key
+    lazily, on the first request, so a missing one otherwise surfaces mid-session.
+    """
+    if settings.stt_provider == "sarvam" or settings.mt_provider == "mayura":
+        settings.require_key()
+    if settings.stt_provider == "groq":
+        settings.require_groq_key()
+    if settings.mt_provider == "gemini":
+        settings.require_gemini_key()
+
+
 def validate_chunk_bounds(min_chunk_s: float, max_chunk_s: float) -> None:
     """Raise ConfigError unless these bounds can produce valid chunks.
 

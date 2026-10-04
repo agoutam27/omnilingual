@@ -6,7 +6,11 @@ in tests/pipeline/test_run_live.py, and the batch path through respx plus a
 generated WAV.
 """
 
+import asyncio
 import json
+import threading
+import time
+from dataclasses import replace
 
 import pytest
 import respx
@@ -15,7 +19,13 @@ from omnilingual.config import ConfigError, load_settings
 from omnilingual.models import Chunk, Segment
 from omnilingual.pipeline.live import LiveOptions
 from omnilingual.ui import secrets
-from omnilingual.ui.session import SessionRunner, build_run, live_options, run_env
+from omnilingual.ui.session import (
+    SessionRunner,
+    build_run,
+    free_output_path,
+    live_options,
+    run_env,
+)
 
 from tests.conftest import make_wav
 from tests.pipeline.test_run_live import (  # reuse the proven seams
@@ -426,11 +436,38 @@ def test_segment_message_carries_every_field_the_page_renders():
     }
 
 
-def test_english_is_none_for_silence():
-    seg = Segment(chunk=Chunk(idx=0, start_s=0.0, end_s=4.0, wav_path="x.wav"),
-                  lang="unknown", prob=0.0, text="", english=None,
-                  status="no_speech")
-    assert SessionRunner.segment_message(0, seg, 0.0, False)["english"] is None
+@respx.mock
+def test_a_dropped_silence_row_carries_no_english_and_counts_as_dropped(respx_mock, tmp_path):
+    """The real contract is which rows carry English and which do not, and which
+    ones the writers dropped — not that None passes through a dict. The middle
+    chunk's whitespace-only answer becomes a no_speech segment that the file drops
+    but the page still has to be told about, or a quiet stretch freezes the view."""
+    _route(respx_mock, texts=("Bravo", "   ", "Vanakkam"))
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    config, stt, mt = _providers()
+    runner, queue, opts, factory = _live(tmp_path, factory)
+
+    runner.start_live(settings=config, stt=stt, translator=mt, diarizer=None,
+                      opts=opts, capture_factory=factory)
+    runner.join(timeout=120)
+
+    silence = [m for m in queue.of("segment") if m["status"] == "no_speech"]
+    assert silence, "the dropped-silence row is the contract"
+    for row in silence:
+        assert row["english"] is None
+        assert row["kept"] is False
+        assert isinstance(row["kept"], bool)
+
+    spoken = [m for m in queue.of("segment") if m["status"] == "ok"]
+    assert spoken and all(m["english"] for m in spoken), "translated rows carry English"
+    # The dropped counter is what the page shows as "N chunks skipped".
+    final = queue.of("state")[-1]
+    assert final["dropped"] >= 1
+    assert final["segments"] == len(queue.of("segment"))
+    # ...and the dropped silence is genuinely absent from the file, or "dropped"
+    # would be a label for a row that was written after all.
+    assert "no speech detected" not in (tmp_path / "meeting.md").read_text(encoding="utf-8")
 
 
 def test_snapshot_is_the_state_payload_the_spec_documents(tmp_path):
@@ -458,14 +495,43 @@ def test_run_env_reads_the_env_file_for_keys_the_process_lacks(tmp_path, monkeyp
     assert run_env()["SARVAM_API_KEY"] == "from-file"
 
 
-def test_run_env_lets_the_process_environment_win(tmp_path, monkeypatch):
-    # `uv run --env-file .env` puts the key in the environment already, and an
-    # explicit export is a more deliberate act than a line in a file.
+def test_run_env_lets_the_env_file_beat_the_launch_environment(tmp_path, monkeypatch):
+    # Precedence is a deliberate decision, not an accident: the .env is the file
+    # the panel manages, so a value exported when the app happened to be launched
+    # must not silently override what the user just typed into it.
     path = _empty_env(tmp_path, monkeypatch)
     monkeypatch.setenv("SARVAM_API_KEY", "from-process")
+    path.write_text("SARVAM_API_KEY=typed-into-panel\n", encoding="utf-8")
+
+    assert run_env()["SARVAM_API_KEY"] == "typed-into-panel"
+    # And the panel's own badge agrees with what the run will do.
+    assert secrets.present()["SARVAM_API_KEY"] is True
+
+
+def test_run_env_still_fills_names_the_env_file_omits(tmp_path, monkeypatch):
+    # The launch environment is still the source for everything the .env does not
+    # mention — that is what keeps `uv run --env-file .env`, and a
+    # `FOO=bar uv run omnilingual-ui`, working.
+    path = _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOME_FUTURE_KEY", "from-process")
     path.write_text("SARVAM_API_KEY=from-file\n", encoding="utf-8")
 
-    assert run_env()["SARVAM_API_KEY"] == "from-process"
+    resolved = run_env()
+    assert resolved["SOME_FUTURE_KEY"] == "from-process"
+    assert resolved["SARVAM_API_KEY"] == "from-file"
+
+
+def test_an_environment_only_key_is_usable_while_the_badge_says_no(tmp_path, monkeypatch):
+    """The one intentional asymmetry with secrets.present(), asserted so it stays
+    a stated contract: the badge answers "is this key in the file the panel
+    manages", and an exported key is a property of how the app was started. The
+    run uses it; the badge does not claim it. Harming the user here would be the
+    alternative — refusing a key that works."""
+    _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SARVAM_API_KEY", "exported-in-the-shell")
+
+    assert secrets.present()["SARVAM_API_KEY"] is False
+    assert run_env()["SARVAM_API_KEY"] == "exported-in-the-shell"
 
 
 @pytest.mark.parametrize("body,expected", [
@@ -479,21 +545,47 @@ def test_run_env_lets_the_process_environment_win(tmp_path, monkeypatch):
     # Whitespace around the value is not part of it.
     ("SARVAM_API_KEY =  spaced  \n", "spaced"),
     # A later empty assignment wins, which is what `export K=` then `K=v` does.
-    ("SARVAM_API_KEY=v\nSARVAM_API_KEY=\n", None),
+    ("SARVAM_API_KEY=v\nSARVAM_API_KEY=\n", ""),
 ])
 def test_run_env_resolves_keys_the_way_present_does(body, expected, tmp_path, monkeypatch):
     """secrets.py deliberately publishes no reader, so run_env parses the .env
-    itself. These cases are the whole seam between the two: if present() and
-    run_env() ever disagree, the panel would report 'configured' for a key the run
-    cannot see. Duplicated parsing is only tolerable while a test pins the two
-    implementations to each other."""
+    itself. These cases are the whole seam between the two. The variable is left
+    in os.environ on purpose: that is the state the previous structural pin could
+    not see, and it is where the two answers came to disagree.
+
+    The invariant is one-directional and is the one that could bite a user:
+    present() reporting a key must mean the run uses that key's .env value, never
+    an older exported one. present() reporting a key absent does NOT mean the run
+    lacks it — see the environment-only test above."""
     _empty_env(tmp_path, monkeypatch)
     secrets.env_path().write_text(body, encoding="utf-8")
-    monkeypatch.delenv("SARVAM_API_KEY", raising=False)
+    monkeypatch.setenv("SARVAM_API_KEY", "from-process")
 
     resolved = run_env().get("SARVAM_API_KEY")
     assert resolved == expected
-    assert bool(secrets.present()["SARVAM_API_KEY"]) is bool(resolved)
+    assert bool(secrets.present()["SARVAM_API_KEY"]) is bool(expected)
+
+
+def test_a_blank_final_assignment_exposes_the_environment_not_an_earlier_line(
+    tmp_path, monkeypatch
+):
+    """`K=v` then `K=` is a deletion, not a redefinition — of the whole key, in both
+    layers. Reading it as "keep the first value" would resurrect a key the user
+    just cleared in the panel, and reading it as "keep the shell's" would let an
+    exported key override a .env that says empty. Blank wins, so the panel and the
+    run agree: no key."""
+    _empty_env(tmp_path, monkeypatch)
+    secrets.env_path().write_text("SARVAM_API_KEY=stale\nSARVAM_API_KEY=\n",
+                                  encoding="utf-8")
+    monkeypatch.setenv("SARVAM_API_KEY", "from-process")
+
+    assert secrets.present()["SARVAM_API_KEY"] is False
+    # The .env layer wins even when it wins with an empty value...
+    assert run_env()["SARVAM_API_KEY"] == ""
+    # ...and load_settings' own truthiness reading turns that into no key at all,
+    # which is the agreement that matters: nothing is usable that the panel calls
+    # unconfigured.
+    assert load_settings(env=run_env()).api_key is None
 
 
 def test_run_env_agrees_with_present_on_an_undecodable_env_file(tmp_path, monkeypatch):
@@ -600,6 +692,407 @@ def test_build_run_defers_provider_names_to_load_settings(tmp_path, monkeypatch)
 def test_build_run_rejects_a_panel_field_the_cli_has_no_flag_for():
     # The parameter surface is exactly the CLI's; an invented option is a bug, and
     # silently dropping one is how a renamed control becomes a setting that does
-    # nothing.
-    with pytest.raises(ValueError):
+    # nothing. ConfigError, not ValueError: the server answers 400 for it, and a
+    # second exception type would turn a renamed control into a 500.
+    with pytest.raises(ConfigError, match="unknown run field"):
         build_run({"mode": "live", "stt": "sarvam", "mt": "mayura", "turbo": True})
+
+
+# --- the whole spec parameter table, one payload, both consumers ------------
+
+# Spec §9's table, field for field. The server receives this and hands it to
+# build_run and to live_options unfiltered; a field either rejects it outright.
+SPEC_PANEL = {
+    "mode": "live", "source": "", "out": "standup.md",
+    "stt": "sarvam", "stt_model": "", "mt": "mayura", "mt_model": "",
+    "diarize": False, "num_speakers": 3, "langs": [], "english_only": False,
+    "work_dir": "", "device": "Omnilingual", "mic_only": False,
+    "target_s": 8.0, "max_chunk_s": 28.0, "min_chunk_s": 5.0,
+    "noise_db": -35.0, "stt_workers": 2, "max_cost": 50.0,
+}
+
+
+def test_the_whole_spec_panel_is_accepted_by_both_consumers(tmp_path, monkeypatch):
+    """Both functions take the same payload. They read disjoint subsets of it, so
+    neither may reject a field the other owns — that is the bug that made every
+    legitimate live start fail validation."""
+    _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SARVAM_API_KEY", "k")
+
+    settings, stt, translator, diarizer = build_run(dict(SPEC_PANEL))
+    opts = live_options(dict(SPEC_PANEL), out=tmp_path / "standup.md")
+
+    assert settings.stt_provider == "sarvam"
+    assert settings.mt_provider == "mayura"
+    assert stt is not None and translator is not None
+    assert diarizer is None
+    assert opts.device == "Omnilingual"
+    assert opts.work_root is None  # work_dir "" -> the pipeline's own default
+    assert (opts.stt_workers, opts.max_cost, opts.english_only) == (2, 50.0, False)
+
+
+def test_the_panel_allowlist_is_the_store_itself():
+    # Not a restated copy: a second list drifts, and the drift rejects a start
+    # request for a field the server never mentioned.
+    from omnilingual.ui import settings as ui_settings
+
+    assert set(SPEC_PANEL) == set(ui_settings.DEFAULTS)
+
+
+# --- a missing credential can never start a run ---------------------------
+
+
+@pytest.mark.parametrize("stt,mt,configured,message", [
+    ("sarvam", "mayura", [], "Sarvam API key missing"),
+    ("groq", "mayura", [], "Sarvam API key missing"),   # mayura alone needs Sarvam
+    ("groq", "gemini", ["GROQ_API_KEY"], "Gemini API key missing"),
+    ("groq", "gemini", ["GEMINI_API_KEY"], "Groq API key missing"),
+])
+def test_a_missing_credential_is_a_configerror_before_a_run_can_start(
+    stt, mt, configured, message, tmp_path, monkeypatch
+):
+    """The regression this closes: providers read their key lazily, so with no key
+    the ConfigError escaped pipeline/live.py's worker thread, which catches only
+    QuotaError and AuthError. The chunk's result never landed, the coordinator
+    waited on it forever, and no end event was ever emitted — a run unreachable
+    except by force-quitting the app. Requiring the credential here makes it a 400
+    raised before any thread exists."""
+    _empty_env(tmp_path, monkeypatch)
+    for key in ("SARVAM_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    for key in configured:
+        monkeypatch.setenv(key, "configured")
+
+    with pytest.raises(ConfigError, match=message):
+        build_run({"mode": "live", "stt": stt, "mt": mt, "langs": [],
+                   "target_s": 8.0, "max_chunk_s": 28.0, "min_chunk_s": 5.0})
+
+
+def test_a_free_tier_run_demands_no_sarvam_key(tmp_path, monkeypatch):
+    # The reason the check asks per backend rather than for one key: picking the
+    # free tiers must not demand an account the user does not have.
+    _empty_env(tmp_path, monkeypatch)
+    for key in ("SARVAM_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "g")
+    monkeypatch.setenv("GEMINI_API_KEY", "m")
+
+    settings, *_ = build_run({"mode": "recording", "stt": "groq", "mt": "gemini",
+                              "langs": [], "max_chunk_s": 28.0, "min_chunk_s": 5.0})
+    assert settings.stt_provider == "groq"
+    assert settings.api_key is None
+
+
+def test_require_keys_is_the_shared_dispatch_not_a_second_copy():
+    """config.require_keys is the one place that knows which key a backend needs;
+    cli.py calls the same function, so adding a provider cannot leave the UI
+    demanding a key it should not."""
+    from omnilingual.config import require_keys
+
+    settings = load_settings(env={})
+    with pytest.raises(ConfigError, match="Sarvam API key missing"):
+        require_keys(settings)
+    ready = load_settings(env={"SARVAM_API_KEY": "k"})
+    require_keys(ready)  # returns; the panel's 200 stands
+
+
+# --- the output path a second live run would collide with ------------------
+
+
+@respx.mock
+def test_a_second_live_run_to_the_same_path_renames_instead_of_failing(respx_mock, tmp_path):
+    """render/live.py opens with O_EXCL, so aiming a second run at an existing
+    path dies with FileExistsError *after* the start request answered 200. The
+    ordinary workflow — the same output today and again tomorrow — works in the
+    CLI and must work here."""
+    _route(respx_mock)
+    config, stt, mt = _providers()
+    out = tmp_path / "standup.md"
+    paths = []
+    for index in range(2):
+        pcm = _pcm_3x20()
+        factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm),
+                                              gated=_gaps())
+        runner, queue, opts, factory = _live(tmp_path, factory)
+        opts = replace(opts, out=out, work_root=tmp_path / f"work{index}")
+        runner.start_live(settings=config, stt=stt, translator=mt, diarizer=None,
+                          opts=opts, capture_factory=factory)
+        runner.join(timeout=120)
+        assert runner.status == "done", [m for m in queue.of("log")]
+        paths.append(runner.out_path)
+
+    assert paths[0] == out
+    assert paths[1] != out, "the second run must not target the first one's file"
+    assert paths[1].is_file() and out.is_file(), "both transcripts survive"
+    assert "· growing" not in paths[1].read_text(encoding="utf-8")
+    # The start request answers with the path actually written, so the page links
+    # to the new file rather than the one that was left alone.
+    assert queue.of("end")[0]["out"] == str(paths[1])
+    assert any("writing" in m["message"] for m in queue.of("log"))
+
+
+def test_free_output_path_only_renames_on_a_collision(tmp_path):
+    absent = tmp_path / "standup.md"
+    assert free_output_path(absent) == absent
+
+    occupied = tmp_path / "standup.md"
+    occupied.write_text("previous transcript", encoding="utf-8")
+    renamed = free_output_path(occupied)
+    assert renamed != occupied
+    assert renamed.suffix == ".md" and renamed.stem.startswith("standup-")
+    # The candidate is offered, not created: the previous transcript stays exactly
+    # where it was, and nothing is rewritten or moved until a run claims the name.
+    assert not renamed.exists()
+    assert occupied.read_text(encoding="utf-8") == "previous transcript"
+
+    renamed.write_text("x", encoding="utf-8")
+    again = free_output_path(occupied)
+    assert again != renamed, "a second collision must not reuse the first name"
+
+
+# --- the thread-to-event-loop bridge ---------------------------------------
+
+
+@respx.mock
+def test_events_bridge_to_a_real_loop_in_order(respx_mock, tmp_path):
+    """The handoff this module exists for: pipeline threads -> call_soon_threadsafe
+    -> an asyncio queue the server drains. FIFO order is the contract, because the
+    page appends rows as they arrive and a reordering would show a shuffled
+    transcript."""
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    config, stt, mt = _providers()
+
+    loop = asyncio.new_event_loop()
+    queue = asyncio.Queue()
+    pump = threading.Thread(target=loop.run_forever, daemon=True)
+    pump.start()
+    try:
+        runner = SessionRunner(run_id="r-loop", queue=queue, loop=loop)
+        opts = LiveOptions(out=tmp_path / "meeting.md", stt_workers=1)
+        runner.start_live(settings=config, stt=stt, translator=mt, diarizer=None,
+                          opts=opts, capture_factory=factory)
+        runner.join(timeout=120)
+        # Let every already-queued callback run before reading the queue.
+        deadline = time.monotonic() + 10
+        while not queue.empty() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.5)
+        delivered = []
+        while not queue.empty():
+            delivered.append(queue.get_nowait())
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        pump.join(timeout=10)
+        loop.close()
+
+    assert runner.status == "done"
+    seqs = [m["seq"] for m in delivered if m["type"] == "segment"]
+    assert seqs == sorted(seqs) and len(seqs) >= 3
+    texts = [m["text"] for m in delivered if m["type"] == "segment"]
+    assert texts.index("Bravo") < texts.index("Vanakkam")
+    assert delivered[0]["type"] == "state"
+    assert delivered[-1]["type"] == "end", "end must survive the bridge too"
+
+
+@respx.mock
+def test_a_closed_loop_costs_the_updates_not_the_run(respx_mock, tmp_path):
+    """A page that disconnects, or an app quitting, closes the loop underneath a
+    live run. Delivery then raises RuntimeError on every event; the meeting must
+    still finish and still leave its transcript."""
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    config, stt, mt = _providers()
+
+    loop = asyncio.new_event_loop()  # never run: start_live's own state lands
+    runner = SessionRunner(run_id="r-closed", queue=asyncio.Queue(), loop=loop)
+    opts = LiveOptions(out=tmp_path / "meeting.md", stt_workers=1)
+    runner.start_live(settings=config, stt=stt, translator=mt, diarizer=None,
+                      opts=opts, capture_factory=factory)
+    loop.close()  # mid-run, with capture still feeding chunks
+    runner.join(timeout=120)
+
+    assert runner.status == "done"
+    assert "Bravo" in (tmp_path / "meeting.md").read_text(encoding="utf-8")
+
+
+# --- stopping: only the mode that can stop says so ------------------------
+
+
+@respx.mock
+def test_stop_does_not_claim_to_stop_a_batch_run(respx_mock, tmp_path):
+    """Only run_live was given a stop channel. Announcing "stopping" for a batch run
+    would leave the page waiting for an interruption that never comes."""
+    _route(respx_mock)
+    recording = tmp_path / "meeting.wav"
+    make_wav(recording, [("tone", 3.0)])
+    config, stt, mt = _providers()
+    runner = SessionRunner(run_id="r-stop", queue=Collector())
+
+    runner.start_recording(settings=config, stt=stt, translator=mt, diarizer=None,
+                           source=recording, work_root=tmp_path / "work",
+                           out=tmp_path / "batch.md")
+    runner.stop()
+    assert runner.status != "stopping"
+    runner.join(timeout=300)
+
+    assert runner.status == "done"
+    assert (tmp_path / "batch.md").is_file()
+
+
+def test_stop_before_start_does_not_poison_the_next_run(tmp_path):
+    """A stop that arrived while the runner was idle belongs to nothing. Carrying
+    it into a run makes that run stop on its first read, so a runner stopped while
+    idle and then started looks broken."""
+    config, stt, mt = _providers()
+    runner = SessionRunner(run_id="r-poison", queue=Collector())
+    runner.stop()
+
+    runner.start_recording(settings=config, stt=stt, translator=mt, diarizer=None,
+                           source=tmp_path / "nope.wav",
+                           work_root=tmp_path / "work",
+                           out=tmp_path / "after.md")
+    runner.join(timeout=60)
+
+    # The run ran to its own conclusion rather than being cut short: a poisoned
+    # flag would have shown up as a run that never even reached its input file.
+    assert runner.status == "failed"
+    assert runner.out_path == tmp_path / "after.md"
+    assert any("nope.wav" in m["message"] for m in runner._queue.of("log"))
+
+
+# --- the english-only sibling, on a real path -----------------------------
+
+
+@respx.mock
+def test_recording_with_english_only_writes_the_sibling_through_the_renderer(
+    respx_mock, tmp_path
+):
+    """render_english_only had no coverage on any path, and it is the file the UI
+    promises to produce for --english-only."""
+    from omnilingual.render.markdown import render_english_only
+
+    _route(respx_mock)
+    recording = tmp_path / "meeting.wav"
+    make_wav(recording, [("tone", 3.0)])
+    config, stt, mt = _providers()
+    queue = Collector()
+    runner = SessionRunner(run_id="r-en", queue=queue)
+    out = tmp_path / "ui.md"
+
+    runner.start_recording(settings=config, stt=stt, translator=mt, diarizer=None,
+                           source=recording, work_root=tmp_path / "work", out=out,
+                           english_only=True)
+    runner.join(timeout=300)
+
+    sibling = out.with_suffix(".en.md")
+    assert sibling.is_file()
+    body = sibling.read_text(encoding="utf-8")
+    assert body.startswith("# Meeting transcript — meeting.wav (English)")
+    assert "->en] Bravo" in body, "English only: the original text is not repeated"
+    assert out.read_text(encoding="utf-8") != body
+    # And it is the pipeline's renderer, not the UI's: the two agree on the same
+    # Transcript because the CLI would produce the same bytes.
+    assert render_english_only.__module__ == "omnilingual.render.markdown"
+
+
+@respx.mock
+def test_recording_without_english_only_writes_no_sibling(respx_mock, tmp_path):
+    _route(respx_mock)
+    recording = tmp_path / "meeting.wav"
+    make_wav(recording, [("tone", 3.0)])
+    config, stt, mt = _providers()
+    out = tmp_path / "ui.md"
+    runner = SessionRunner(run_id="r-noen", queue=Collector())
+    runner.start_recording(settings=config, stt=stt, translator=mt, diarizer=None,
+                           source=recording, work_root=tmp_path / "work", out=out)
+    runner.join(timeout=300)
+
+    assert out.is_file()
+    assert not out.with_suffix(".en.md").exists()
+
+
+# --- a halt is the marker AND the status ----------------------------------
+
+
+def test_a_halt_needs_both_the_marker_and_the_failed_status():
+    # run_live writes the marker into a stt_failed segment and nothing else
+    # produces that text, so the conjunction cannot misfire. Matching the text
+    # alone would call a halt any future provider error carrying the string, and
+    # matching the status alone would call every failed chunk a halt — the exact
+    # confusion this state exists to avoid.
+    from omnilingual.pipeline.live import _HALT_TEXT
+    from omnilingual.ui.session import _is_halt
+
+    chunk = Chunk(idx=0, start_s=0.0, end_s=4.0, wav_path="x.wav")
+    marker = _HALT_TEXT["cost"]
+    assert _is_halt(Segment(chunk, "unknown", 0.0, marker, None, "stt_failed"))
+    assert not _is_halt(Segment(chunk, "unknown", 0.0, marker, None, "ok")), (
+        "a marker string with a healthy status is not a halt")
+    assert not _is_halt(Segment(chunk, "unknown", 0.0, "[transcription failed]",
+                                None, "stt_failed")), (
+        "an ordinary failed chunk is not a halt")
+    assert not _is_halt(Segment(chunk, "hi-IN", 0.9, "Bravo", "Hello", "ok"))
+
+
+# --- the failed/done distinction is about whether a file exists ------------
+
+
+@respx.mock
+def test_a_capture_that_never_opens_is_failed_because_no_file_exists(respx_mock, tmp_path):
+    """run_live returns 1 for exactly one reason: the capture never opened, so it
+    never created the writer and there is no transcript. That is what separates it
+    from exit 2, which means a valid file with segments that need attention —
+    calling that 'failed' would make the UI offer to recover something it must not."""
+    from omnilingual.audio.live_capture import CaptureError
+
+    class DeadCapture(FakeCapture):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, blocks=[], gated=[], **kwargs)
+
+        def open(self):
+            raise CaptureError("no such device")
+
+    config, stt, mt = _providers()
+    queue = Collector()
+    runner = SessionRunner(run_id="r-noopen", queue=queue)
+    out = tmp_path / "meeting.md"
+    opts = LiveOptions(out=out, stt_workers=1)
+
+    runner.start_live(settings=config, stt=stt, translator=mt, diarizer=None,
+                      opts=opts,
+                      capture_factory=lambda *a, **k: DeadCapture(*a, **k))
+    runner.join(timeout=60)
+
+    assert runner.status == "failed"
+    assert queue.of("end")[0]["exit_code"] == 1
+    assert not out.exists(), "no writer, so no file — that is why this is 'failed'"
+    assert any("capture failed" in m["message"] for m in queue.of("status"))
+    # The directory exists and holds a session.json, but nothing is sealed in it,
+    # so recovery must not be offered for it.
+    assert runner.session_dir is not None
+    assert runner.recoverable is False
+    assert queue.of("end")[0]["recoverable"] is False
+
+
+def test_recover_reports_a_directory_that_is_not_a_live_session(tmp_path):
+    """The Recover button is fed whatever the runs list hands it, so a directory
+    that is not a session has to come back as a reported failure rather than an
+    exception out of the request handler."""
+    config, stt, mt = _providers()
+    queue = Collector()
+    runner = SessionRunner(run_id="r-bogus", queue=queue)
+    bogus = tmp_path / "not-a-session"
+    bogus.mkdir()
+
+    runner.recover(session_dir=bogus, settings=config, stt=stt, translator=mt,
+                   diarizer=None, out=tmp_path / "recovered.md")
+    runner.join(timeout=60)
+
+    assert runner.status == "failed"
+    assert queue.of("end")[0]["exit_code"] != 0
+    assert any("live session" in m["message"] for m in queue.of("log"))
+    assert not (tmp_path / "recovered.md").exists()
+    assert queue.of("state")[-1]["error"]

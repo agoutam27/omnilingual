@@ -4,6 +4,7 @@ from omnilingual.config import (
     ConfigError,
     Settings,
     load_settings,
+    require_keys,
     validate_chunk_bounds,
     validate_target_s,
 )
@@ -158,3 +159,36 @@ def test_validate_target_s_full_message():
     with pytest.raises(ConfigError) as exc:
         validate_target_s(4.9, 5.0, 28.0)
     assert str(exc.value) == expected
+
+
+def test_require_keys_accepts_a_run_with_the_keys_it_needs():
+    require_keys(load_settings(env={"SARVAM_API_KEY": "k123"}))
+
+
+@pytest.mark.parametrize("env,stt,mt,message", [
+    ({}, "sarvam", "mayura", "Sarvam API key missing"),
+    # mayura alone needs the Sarvam key even when speech-to-text does not.
+    ({"GROQ_API_KEY": "g"}, "groq", "mayura", "Sarvam API key missing"),
+    ({"SARVAM_API_KEY": "k", "GROQ_API_KEY": "g"}, "groq", "gemini",
+     "Gemini API key missing"),
+    ({"SARVAM_API_KEY": "k", "GEMINI_API_KEY": "m"}, "groq", "gemini",
+     "Groq API key missing"),
+])
+def test_require_keys_demands_only_the_selected_backends_key(env, stt, mt, message):
+    """Picking free backends on both axes must not demand a Sarvam key. This is the
+    dispatch the UI used to have to copy; it lives here so there is one of them."""
+    with pytest.raises(ConfigError, match=message):
+        require_keys(load_settings(env=env, stt_provider=stt, mt_provider=mt))
+
+
+def test_require_keys_lets_the_free_tier_pair_through():
+    require_keys(load_settings(env={"GROQ_API_KEY": "g", "GEMINI_API_KEY": "m"},
+                               stt_provider="groq", mt_provider="gemini"))
+
+
+def test_require_keys_ignores_an_unselected_backends_key():
+    # A Groq key is present but the run is on Sarvam: still a ConfigError. This is
+    # the case a "any key is enough" check would let through into a 402.
+    with pytest.raises(ConfigError, match="Sarvam API key missing"):
+        require_keys(load_settings(env={"GROQ_API_KEY": "g"},
+                                   stt_provider="sarvam", mt_provider="mayura"))

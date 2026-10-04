@@ -28,7 +28,7 @@ from omnilingual.audio.live_capture import (
 )
 from omnilingual.audio.normalize import FfmpegError, FfmpegMissingError, ensure_ffmpeg
 from omnilingual.cache import JsonCache
-from omnilingual.config import ConfigError, load_settings, validate_chunk_bounds, validate_target_s
+from omnilingual.config import ConfigError, load_settings, require_keys, validate_chunk_bounds, validate_target_s
 from omnilingual.http import AuthError, QuotaError, SarvamError
 from omnilingual.models import Cost, Segment, chunks_from_json
 from omnilingual.pipeline import LIVE_SESSION_KIND, estimate, prepare, run, run_from_chunks, work_dir_for
@@ -68,17 +68,10 @@ def _fail(msg: str, code: int = 1) -> NoReturn:
 
 
 def _require_keys(settings) -> None:
-    """Check only the credentials the selected backends actually need.
-
-    Picking free backends on both axes (e.g. `--stt groq --mt gemini`) must not
-    demand a Sarvam key, so each provider's key is required by its own path.
-    """
-    if settings.stt_provider == "sarvam" or settings.mt_provider == "mayura":
-        settings.require_key()
-    if settings.stt_provider == "groq":
-        settings.require_groq_key()
-    if settings.mt_provider == "gemini":
-        settings.require_gemini_key()
+    """The CLI's own spelling of config.require_keys, kept so the three existing
+    call sites stay put and the move stays a pure move. All of the policy — which
+    key which backend needs, and that only those are demanded — is in config."""
+    require_keys(settings)
 
 
 def _print_estimate(name: str, duration: float, n_chunks: int, cost: Cost,

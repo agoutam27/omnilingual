@@ -11,8 +11,9 @@ Nothing else may import omnilingual.pipeline.
 API keys reach the providers through run_env() -> load_settings(env=...), never
 through a flag value: a key in argv is readable by any user on the machine from
 `ps`. secrets.py deliberately publishes no reader, so run_env() reads the .env
-itself and is pinned to secrets.present()'s resolution by a test — the two must
-never disagree about which key a run would see.
+itself, and the one invariant tests hold it to is that a key the user typed into
+that .env is never shadowed by the launch environment — see run_env's docstring
+for the precedence decision that guarantees it.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import os
 import re
 import threading
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from omnilingual.config import (
     ConfigError,
     Settings,
     load_settings,
+    require_keys,
     validate_chunk_bounds,
     validate_target_s,
 )
@@ -49,7 +52,7 @@ from omnilingual.stt import build_stt
 from omnilingual.stt.base import STTProvider
 from omnilingual.translate import build_translator
 from omnilingual.translate.base import Translator
-from omnilingual.ui import secrets
+from omnilingual.ui import secrets, settings
 
 log = logging.getLogger(__name__)
 
@@ -60,13 +63,16 @@ log = logging.getLogger(__name__)
 # halt back into a plain 'done'. A rename breaks the import loudly instead.
 _HALT_MARKERS = frozenset(_HALT_TEXT.values())
 
-# Every field the panel may send that config.load_settings understands. Anything
-# else is a renamed control, and dropping it silently is how a setting ends up
-# doing nothing: settings.save() rejects the same way for the same reason.
-_PANEL_SETTINGS_FIELDS = frozenset({
-    "mode", "stt", "stt_model", "mt", "mt_model", "diarize", "num_speakers",
-    "langs", "max_chunk_s", "min_chunk_s", "target_s",
-})
+# Only run_live was given a stop channel, so only it can be stopped. The batch
+# loop and run_from_chunks have no equivalent, and a status that says otherwise
+# would be a stop the user is waiting for that never arrives.
+_STOPPABLE_MODES = frozenset({"live"})
+
+# The panel's fields, taken from the store that owns them rather than restated
+# here: two lists drift, and the drift shows up as a legitimate start request
+# rejected for a field the server never mentioned. build_run and live_options
+# each read their own subset of this one set, so the same payload goes to both.
+_PANEL_FIELDS = frozenset(settings.DEFAULTS)
 
 _ASSIGN = re.compile(
     r"^\s*(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.*?)\s*$"
@@ -82,46 +88,62 @@ def _unquote(value: str) -> str:
     return value
 
 
-def run_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment a run inherits: the process environment, with the repo's
-    gitignored .env filling in what the process does not already carry.
+def _env_file_values() -> dict[str, str]:
+    """The .env layer: every assignment it holds, last line per name winning.
 
-    The CLI's documented way to pick up keys is `uv run --env-file .env`, so a
-    shell launch already has them in os.environ and this function is a no-op for
-    it. Launched from Finder, a menu-bar item or a bare `uv run omnilingual-ui`
-    there is nothing in the environment, and the keys the panel wrote into that
-    .env have to be found somehow — so they are read here, into a mapping, and
-    handed to load_settings(env=...). A value never reaches argv, a subprocess, a
-    log line or an event message; it goes process memory -> Settings and no
-    further.
+    One resolver for the whole UI, so nothing else has to decide what the .env
+    means. secrets.py exposes no reader — a key value must never be able to leave
+    that module — so the parse is duplicated here, and pinned to
+    secrets.present() by tests that assert the same shapes.
 
-    The file is secrets.env_path(), so OMNILINGUAL_ENV_FILE moves both modules at
-    once, and the parse mirrors what a dotenv loader does: `export NAME=`, quoted
-    values, surrounding whitespace, and a last line that overrides an earlier one.
-    An .env that is not UTF-8 contributes nothing rather than aborting the run —
-    the same choice present() makes, and why the panel can still open.
+    An .env that is not UTF-8 contributes nothing rather than aborting the run,
+    which is what secrets.present() does with it too: the file exists, holds keys
+    this process never read, and guessing at the readable part is worse than
+    treating the layer as empty.
     """
-    resolved = dict(os.environ if env is None else env)
+    values: dict[str, str] = {}
     try:
         # newline="" so a CRLF .env is read without its \r being rewritten away,
         # matching secrets._lines().
         with secrets.env_path().open("r", encoding="utf-8", newline="") as fh:
             text = fh.read()
     except (OSError, ValueError):
-        return resolved  # absent, unreadable, or not UTF-8: nothing to add
-    layer: dict[str, str] = {}
+        return values
     for line in text.split("\n"):
         if match := _ASSIGN.match(line):
-            # Last assignment wins, and a blank one erases: `tail -n 1`, which is
+            # Last assignment wins and a blank one erases: `tail -n 1`, which is
             # how present() resolves a duplicated key.
-            layer[match["name"]] = _unquote(match["value"])
-    for name, value in layer.items():
-        # An already-set variable wins, and a blank one counts as unset — the same
-        # reading load_settings applies when it turns env.get(...) into a key or
-        # None. So a final `NAME=` contributes nothing, and present() reports that
-        # same key absent: the panel cannot claim a run would see it.
-        if value and not resolved.get(name):
-            resolved[name] = value
+            values[match["name"]] = _unquote(match["value"])
+    return values
+
+
+def run_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment a run inherits: the launch environment, with the repo's
+    gitignored .env layered over it.
+
+    Precedence is deliberate and is the opposite of the usual convention: **the
+    .env wins over a variable already in the process environment.** The .env is
+    the file the panel *manages* — secrets.set_key writes it, and the panel edits
+    it — so a GUI that let a value exported when the app happened to be launched
+    override what the user just typed would silently discard their input. The
+    launch environment still fills every name the .env does not mention, which is
+    what keeps `uv run --env-file .env` working and what lets a `FOO=bar uv run
+    omnilingual-ui` reach a provider that has no key of its own.
+
+    That leaves one intentional asymmetry with secrets.present(), which reports
+    the .env layer only: a key that exists *only* in the launch environment is
+    usable by a run while the panel calls it unconfigured. That is correct rather
+    than a disagreement — the badge answers "is this key in the file I manage",
+    and an exported key is a property of how the app was started. The invariant
+    that does hold, and that tests pin, is the one that could bite: **a key in
+    the .env is never shadowed by the environment.** The panel must never report
+    "configured" for a value the run will not use.
+
+    A value never reaches argv, a subprocess, a log line or an event message; it
+    goes process memory -> Settings and no further.
+    """
+    resolved = dict(os.environ if env is None else env)
+    resolved.update(_env_file_values())
     return resolved
 
 
@@ -140,10 +162,23 @@ def build_run(
     Keys are not parameters. They arrive through run_env() inside load_settings,
     so there is no code path on which a key could be logged, put in a URL, or
     appended to a command line.
+
+    require_keys is called here, before this function returns, and that is the
+    whole point of calling it here rather than inside the run. The providers read
+    their key lazily, on the first request, so a missing one raises from inside
+    pipeline/live.py's worker thread — where live catches QuotaError and AuthError
+    and nothing else, so the chunk's result never lands and the coordinator waits
+    on it forever. A run with no API key configured then hangs with no end event
+    and no way out but force-quitting the app. Raising ConfigError here turns that
+    into the 400 it should always have been.
+
+    Every failure this raises is a ConfigError, deliberately including an unknown
+    field: the server answers 400, and a second exception type would turn a
+    renamed control into a 500.
     """
-    unknown = sorted(set(values) - _PANEL_SETTINGS_FIELDS)
+    unknown = sorted(set(values) - _PANEL_FIELDS)
     if unknown:
-        raise ValueError(f"unknown run field(s): {', '.join(unknown)}")
+        raise ConfigError(f"unknown run field(s): {', '.join(unknown)}")
     mode = str(values.get("mode", "live"))
     min_chunk_s = float(values.get("min_chunk_s", 5.0))
     max_chunk_s = float(values.get("max_chunk_s", 28.0))
@@ -167,6 +202,7 @@ def build_run(
     validate_chunk_bounds(min_chunk_s, max_chunk_s)
     if mode == "live":
         validate_target_s(float(values.get("target_s", 8.0)), min_chunk_s, max_chunk_s)
+    require_keys(settings)
     return (settings, build_stt(settings), build_translator(settings),
             build_diarizer(settings) if settings.diarizer else None)
 
@@ -174,7 +210,17 @@ def build_run(
 def live_options(
     values: Mapping[str, object], *, out: Path, work_root: Path | None = None
 ) -> LiveOptions:
-    """LiveOptions from panel values. One place holds the field-to-flag mapping.
+    """LiveOptions from the panel payload. One place holds the field-to-flag mapping.
+
+    Takes the same payload build_run takes — the whole panel row, unfiltered — so
+    the server hands one mapping to both instead of splitting it by hand. It reads
+    only the live fields; the rest are build_run's, and neither function rejects
+    the other's.
+
+    `out` is a keyword rather than a field because the caller must resolve it
+    against a base directory first, and because the collision rename in
+    free_output_path has to be applied to the resolved path. A panel `out` is
+    therefore ignored here and is not an error.
 
     work_dir stores "" rather than a literal ".omnilingual" on purpose (see
     ui/settings.py): an empty value has to reach LiveOptions as None so the
@@ -197,6 +243,47 @@ def live_options(
         work_root=root,
         english_only=bool(values.get("english_only")),
     )
+
+
+def free_output_path(path: Path, *, now: datetime | None = None) -> Path:
+    """A path no live run is currently writing, renaming only on a collision.
+
+    render/live.py opens the output with O_EXCL, so a second live run aimed at an
+    existing path dies with FileExistsError after the start request has already
+    answered 200. The CLI sidesteps this for its own --out; the UI has to do the
+    same or "transcribe the same file today and again tomorrow" is a hard failure
+    the user cannot act on.
+
+    Renamed, not overwritten and not an error: a previous transcript is the user's,
+    and clobbering it because the app was started twice would be worse than a
+    suffixed filename. The scheme matches cli.py's, which is not shared code —
+    that module imports typer and rich, which the UI must not pull in — and this
+    is a filename convention rather than a validation rule, so the one thing a
+    drift could cost is a different name, never a wrong one.
+    """
+    if not path.exists():
+        return path
+    stamp = (now or datetime.now()).strftime("%H%M")
+    candidate = path.with_name(f"{path.stem}-{stamp}{path.suffix}")
+    serial = 2
+    while candidate.exists():
+        candidate = path.with_name(
+            f"{path.stem}-{stamp}-{serial}{path.suffix}")
+        serial += 1
+    return candidate
+
+
+def _is_halt(seg) -> bool:
+    """Whether a segment is one of run_live's halt markers.
+
+    Both halves are required. run_live writes the marker text into a stt_failed
+    segment and nothing else ever produces that text, so the conjunction cannot
+    misfire — but matching the text alone would call a halt any future provider
+    error carrying that same string, and matching the status alone would call
+    every failed segment a halt, which is the failure this state exists to
+    distinguish.
+    """
+    return seg.status == "stt_failed" and seg.text in _HALT_MARKERS
 
 
 class SessionRunner:
@@ -278,8 +365,16 @@ class SessionRunner:
     def start_live(self, *, settings, stt, translator, diarizer,
                    opts: LiveOptions, capture_factory=LiveCapture) -> None:
         self._begin("live")
-        self._out = opts.out
         self._cost_cap = opts.max_cost
+        # Before the thread starts and before the caller reads _out, so the path
+        # the start request reports is the path the run actually writes.
+        out = free_output_path(opts.out)
+        if out != opts.out:
+            opts = replace(opts, out=out)
+            self._emit({"type": "log", "level": "warn",
+                        "message": f"{opts.out.name} exists; writing "
+                                   f"{out.name} instead"})
+        self._out = out
         self._spawn(self._live, settings, stt, translator, diarizer, opts,
                     capture_factory)
 
@@ -300,11 +395,20 @@ class SessionRunner:
                     diarizer, out, english_only)
 
     def stop(self) -> None:
-        """Ask the run to stop. Idempotent, and safe before a thread exists."""
+        """Ask the run to stop. Idempotent, and safe before a thread exists.
+
+        A no-op for a mode that cannot stop. Only run_live takes a stop channel;
+        the batch loop and run_from_chunks have none, so their threads run to
+        completion whatever is asked. Flipping their status to "stopping" would
+        announce a stop that never happens, leaving the page waiting for an
+        interruption that is not coming.
+        """
+        self._stop.set()
+        if self._mode not in _STOPPABLE_MODES:
+            return
         with self._lock:
             if self._status == "running":
                 self._status = "stopping"
-        self._stop.set()
         self._push_state()
 
     def join(self, timeout: float | None = None) -> None:
@@ -326,6 +430,10 @@ class SessionRunner:
         self._started = datetime.now()
         self._status = "running"
         self._halted = False
+        # A stop() that arrived before the run did belongs to nothing: carrying it
+        # into the run would make the new one stop on its first read, so a runner
+        # that was stopped while idle and then started would look broken.
+        self._stop.clear()
 
     def _spawn(self, target, *args) -> None:
         # The state goes out before the thread starts, so the first message the
@@ -350,7 +458,7 @@ class SessionRunner:
             self._emit({"type": "status", "message": message})
 
         def on_segment(seg, keep: bool) -> None:
-            if seg.text in _HALT_MARKERS:
+            if _is_halt(seg):
                 self._halted = True
             self._on_segment(seg, keep, 0.0)
 
@@ -529,6 +637,13 @@ class SessionRunner:
         }
 
 
-# Re-exported so a caller that catches a run's configuration problem does not have
-# to reach past this module for the exception type.
-__all__ = ["ConfigError", "SessionRunner", "build_run", "live_options", "run_env"]
+# ConfigError is re-exported so a caller turning a bad start request into a 400
+# catches one exception type: build_run raises nothing else.
+__all__ = [
+    "ConfigError",
+    "SessionRunner",
+    "build_run",
+    "free_output_path",
+    "live_options",
+    "run_env",
+]
