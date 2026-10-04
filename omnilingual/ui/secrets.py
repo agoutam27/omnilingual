@@ -3,10 +3,20 @@
 A value never leaves this module: present() answers with booleans, and nothing
 here echoes, logs, or passes a value to a subprocess, so it cannot appear in
 `ps`. The .env line semantics deliberately match scripts/setup-mac.sh — keep
-comments and unrelated keys, replace a key in place rather than appending a
-duplicate, mode 0600, write atomically. That shell implementation cannot be
-imported, so this is a cross-language duplication of a small invariant set; if
-one changes, change both.
+comments and unrelated keys, rewrite every copy of a key in place rather than
+appending a duplicate or leaving a stale one, mode 0600, write atomically. That
+shell implementation cannot be imported, so this is a cross-language duplication
+of a small invariant set; if one changes, change both.
+
+Two deliberate divergences from the shell, both applied uniformly across
+present/set_key/clear so the three can never disagree about which lines belong
+to a key:
+
+  - `export NAME=` counts as the key's line. setup-mac.sh's pattern does not
+    match it at all, and would append a second copy; treating it as the key is
+    the more useful behaviour.
+  - present() resolves a duplicated key to its last line, matching env_get's
+    `tail -n 1`.
 """
 
 from __future__ import annotations
@@ -49,29 +59,41 @@ def _lines() -> list[str]:
 
 
 def present() -> dict[str, bool]:
-    """A boolean per known key. Never the values themselves."""
+    """A boolean per known key. Never the values themselves.
+
+    The last matching line decides, like env_get's `tail -n 1` and like the
+    dotenv loader `uv run --env-file` uses, so this answers "would the run see
+    this key" rather than "does some line mention it".
+    """
     lines = _lines()
     found: dict[str, bool] = {}
     for name in KEYS:
-        pattern = _assign(name)
-        found[name] = any(
-            _unquote(match.group(1))
-            for line in lines if (match := pattern.match(line))
-        )
+        value = ""
+        for line in lines:
+            if match := _assign(name).match(line):
+                value = _unquote(match.group(1))
+        found[name] = bool(value)
     return found
 
 
 def set_key(name: str, value: str) -> None:
-    """Insert or replace one key, in place, leaving every other line alone."""
+    """Rewrite every line for this key in place, appending when there is none.
+
+    All matches, not the first: env_set's loop has no break, so on a
+    hand-duplicated key it rewrites every copy. Rewriting only the first would
+    leave the second holding the previous value — a live secret surviving a
+    rotation the user believes was complete.
+    """
     if name not in KEYS:
         raise ValueError(f"unknown key: {name}")
     lines = _lines()
     pattern = _assign(name)
+    replaced = False
     for index, line in enumerate(lines):
         if pattern.match(line):
             lines[index] = f"{name}={value}"
-            break
-    else:
+            replaced = True
+    if not replaced:
         lines.append(f"{name}={value}")
     _write(lines)
 
