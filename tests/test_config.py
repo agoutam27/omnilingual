@@ -132,6 +132,14 @@ def test_validate_chunk_bounds_message_keeps_cli_wording():
     assert "--max-chunk-s must be < 30" in str(exc.value)
 
 
+def test_validate_chunk_bounds_full_message():
+    # Pin the exact full message string so a future text change fails a test.
+    expected = "--max-chunk-s must be < 30 and > --min-chunk-s, and at least 2x --min-chunk-s"
+    with pytest.raises(ConfigError) as exc:
+        validate_chunk_bounds(5.0, 40.0)
+    assert str(exc.value) == expected
+
+
 def test_validate_target_s_accepts_value_inside_bounds():
     validate_target_s(8.0, 5.0, 28.0)
     validate_target_s(5.0, 5.0, 28.0)
@@ -142,3 +150,11 @@ def test_validate_target_s_accepts_value_inside_bounds():
 def test_validate_target_s_rejects_outside_bounds(target):
     with pytest.raises(ConfigError):
         validate_target_s(target, 5.0, 28.0)
+
+
+def test_validate_target_s_full_message():
+    # Pin the exact full message string so a future text change fails a test.
+    expected = "--target-s must be between --min-chunk-s and --max-chunk-s"
+    with pytest.raises(ConfigError) as exc:
+        validate_target_s(4.9, 5.0, 28.0)
+    assert str(exc.value) == expected

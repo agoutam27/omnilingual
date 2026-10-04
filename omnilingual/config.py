@@ -156,7 +156,7 @@ def validate_chunk_bounds(min_chunk_s: float, max_chunk_s: float) -> None:
             or max_chunk_s < 2 * min_chunk_s):
         raise ConfigError(
             "--max-chunk-s must be < 30 and > --min-chunk-s, and at least 2x "
-            f"--min-chunk-s (got {min_chunk_s:g} and {max_chunk_s:g})")
+            f"--min-chunk-s")
 
 
 def validate_target_s(target_s: float, min_chunk_s: float,
@@ -164,5 +164,4 @@ def validate_target_s(target_s: float, min_chunk_s: float,
     """Raise ConfigError unless the live target chunk length fits the bounds."""
     if not min_chunk_s <= target_s <= max_chunk_s:
         raise ConfigError(
-            "--target-s must be between --min-chunk-s and --max-chunk-s "
-            f"(got {target_s:g}, {min_chunk_s:g} and {max_chunk_s:g})")
+            "--target-s must be between --min-chunk-s and --max-chunk-s")
