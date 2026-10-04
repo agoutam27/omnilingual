@@ -56,15 +56,14 @@ class FakeCapture:
         import time
 
         pending = list(self._gated)
-        while pending or not self.closed:
+        # Bounded by `closed`: a stopped run never consumes enough for the
+        # thresholds to fire, and without this the generator spins forever,
+        # which only `th.join(timeout=30)` in run_live would eventually abandon.
+        while pending and not self.closed:
             ready = [ln for need, ln in pending if self.consumed >= need]
             pending = [(need, ln) for need, ln in pending if self.consumed < need]
             for ln in ready:
                 yield ln
-            if not pending and self.closed:
-                return
-            if not pending:
-                return
             time.sleep(0.001)
 
     def close(self):
@@ -321,7 +320,10 @@ def test_on_segment_fires_in_order_with_keep_flag(respx_mock, tmp_path):
 
 @respx.mock
 def test_on_segment_reports_every_sealed_chunk(respx_mock, tmp_path):
-    _route(respx_mock)
+    # The middle chunk returns whitespace-only text, which process_chunk turns
+    # into a no_speech segment that the writers drop — the silence the callback
+    # must still be told about, or a live view freezes during a quiet stretch.
+    _route(respx_mock, texts=("Bravo", "   ", "Vanakkam"))
     pcm = _pcm_3x20()
     factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
     settings = load_settings(api_key="k")
@@ -333,11 +335,13 @@ def test_on_segment_reports_every_sealed_chunk(respx_mock, tmp_path):
              MayuraTranslator(settings), status=lambda m: None,
              capture_factory=factory,
              on_segment=lambda seg, keep: seen.append((seg.status, keep)))
-    # Whatever the ok/silence mix, the callback must be told about every sealed
-    # chunk — including any silence the writer drops — or a live view freezes
-    # during a quiet stretch and looks broken.
     assert seen, "on_segment must fire at least once"
     assert all(isinstance(keep, bool) for _, keep in seen)
+    # The dropped-silence row is the contract: firing only inside `if keep:`
+    # would silence the UI during a quiet stretch, and this is the assertion
+    # that catches it.
+    assert ("no_speech", False) in seen
+    assert ("ok", True) in seen
 
 
 @respx.mock
@@ -367,8 +371,20 @@ def test_on_segment_exception_does_not_end_the_run(respx_mock, tmp_path):
 
 @respx.mock
 def test_stop_event_stops_the_run(respx_mock, tmp_path):
+    # 600 blocks (10 min) sealed at a 14 s max chunk: an unstopped run over
+    # this capture emits 44 segments, so `len(seen) < 10` can only hold if the
+    # caller's flag truncated the run. Measured across 0/50/100/200 ms of
+    # injected STT latency the count is 1/3/5/7 — a bound, not an exact count,
+    # because stop truncates capture while the pipeline still drains whatever
+    # it already enqueued.
+    #
+    # One repeated 1 s tone keeps this cheap to build (raw_pcm packs the tone
+    # per sample). The resulting chunks are byte-identical and share one STT
+    # cache entry, which is harmless here because this test counts emitted
+    # segments rather than transcript content — but it is the Task 2 trap for
+    # any test that asserts on text.
     _route(respx_mock)
-    pcm = _pcm_3x20()
+    pcm = raw_pcm([("silence", 1.0)]) + raw_pcm([("tone", 1.0)]) * 599
     factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
     settings = load_settings(api_key="k")
     from omnilingual.stt.sarvam import SarvamSTT
@@ -381,12 +397,16 @@ def test_stop_event_stops_the_run(respx_mock, tmp_path):
         seen.append(seg)
         stop.set()  # stop after the first row, like a user pressing Stop
 
-    code = run_live(_opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+    code = run_live(_opts(tmp_path, stt_workers=1, target_s=7.0,
+                         min_chunk_s=5.0, max_chunk_s=14.0),
+                    settings, SarvamSTT(settings),
                     MayuraTranslator(settings), status=lambda m: None,
                     capture_factory=factory,
                     on_segment=on_segment, stop_event=stop)
     assert stop.is_set()
-    assert len(seen) < 3, "stopping after the first row must cut the run short"
+    assert code == 0
+    assert seen, "the callback must fire at least once"
+    assert len(seen) < 10, "the caller's stop flag must truncate the run"
     # Whatever was captured is still a valid, finalized file.
     assert (tmp_path / "meeting.md").exists()
     assert "· growing" not in (tmp_path / "meeting.md").read_text(encoding="utf-8")
