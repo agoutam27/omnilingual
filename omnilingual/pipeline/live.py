@@ -147,8 +147,19 @@ _HALT_TEXT = {
 def run_live(opts: LiveOptions, settings, stt, translator, *,
              diarizer=None,
              status: Callable[[str], None] | None = None,
-             capture_factory: Callable = LiveCapture) -> int:
-    """Run a live session. Returns the process exit code (0/1/2)."""
+             capture_factory: Callable = LiveCapture,
+             on_segment: Callable[[Segment, bool], None] | None = None,
+             stop_event: threading.Event | None = None) -> int:
+    """Run a live session. Returns the process exit code (0/1/2).
+
+    on_segment(seg, keep) is the structured counterpart to the pre-rendered
+    `status` strings: it carries the transcript text a GUI needs to render a
+    row. It fires for every sealed chunk, including silence the writers drop, so
+    a live view never appears frozen during a quiet stretch. A raising callback
+    is logged and swallowed — UI code must not be able to end the session.
+    stop_event lets a host that owns SIGINT (a GUI server) stop the run without
+    sending a signal.
+    """
     say = status or (lambda msg: None)
     root = opts.work_root or opts.out.parent / ".omnilingual"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -207,7 +218,7 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
     state = {"accrued": 0.0, "halt": None, "enqueued": 0, "next": 0,
              "last_kept_end": 0.0, "sealed_end": 0.0, "sealed_n": 0,
              "appended_n": 0, "appended_end": 0.0, "bad": False, "died": False}
-    stop = threading.Event()
+    stop = stop_event or threading.Event()
     feeding_done = threading.Event()
     capture_done = threading.Event()
     t0 = time.monotonic()
@@ -367,8 +378,13 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
         th.start()
 
     # Two-stage Ctrl+C: first stops gracefully, second reaps ffmpeg and exits.
+    # Only a main-thread host can install a handler — signal.signal() raises
+    # ValueError otherwise — and a GUI server owns SIGINT itself, stopping the
+    # run through stop_event instead. getsignal() is safe from any thread, so
+    # only the registration is conditional.
     sigints = 0
     prev = signal.getsignal(signal.SIGINT)
+    owns_sigint = threading.current_thread() is threading.main_thread()
 
     def on_sigint(signum, frame):
         nonlocal sigints
@@ -380,7 +396,8 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
             capture.close()
             os._exit(2)
 
-    signal.signal(signal.SIGINT, on_sigint)
+    if owns_sigint:
+        signal.signal(signal.SIGINT, on_sigint)
     last_lag_log = t0
     final = False
     try:
@@ -429,6 +446,13 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
             if (seg.status == "no_speech"
                     and seg.chunk.end_s - state["last_kept_end"] <= 30.0):
                 keep = False
+            if on_segment is not None:
+                # After `keep` is known so the caller can mirror the file, and
+                # before the writers so a slow consumer cannot delay capture.
+                try:
+                    on_segment(seg, keep)
+                except Exception:  # noqa: BLE001 - a UI bug must not end the run
+                    log.exception("on_segment callback failed")
             if keep:
                 for w in writers:
                     w.append_segment(seg, delta)
@@ -447,7 +471,8 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
                     say(f"[live {elapsed()}] sealed {state['sealed_n']} · "
                         f"appended {state['appended_n']} · lag ~{lag:.0f} s")
     finally:
-        signal.signal(signal.SIGINT, prev)
+        if owns_sigint:
+            signal.signal(signal.SIGINT, prev)
         for w in writers:
             try:
                 w.finalize()

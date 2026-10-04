@@ -1,4 +1,5 @@
 import re
+import threading
 
 import httpx
 import respx
@@ -292,3 +293,131 @@ def test_contaminated_probe_still_transcribes_speech(respx_mock, tmp_path):
     assert any("already speaking" in m for m in msgs)
     text = (tmp_path / "meeting.md").read_text(encoding="utf-8")
     assert "Bravo" in text
+
+
+@respx.mock
+def test_on_segment_fires_in_order_with_keep_flag(respx_mock, tmp_path):
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    seen = []
+    code = run_live(_opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+                    MayuraTranslator(settings), status=lambda m: None,
+                    capture_factory=factory,
+                    on_segment=lambda seg, keep: seen.append((seg.text, keep)))
+    assert code == 0
+    assert len(seen) >= 3
+    # Order is the contract: rows must arrive in transcript order, not in
+    # worker completion order.
+    texts = [t for t, _ in seen]
+    assert texts.index("Bravo") < texts.index("Hello") < texts.index("Vanakkam")
+    # Every scripted chunk here carries speech, so all are kept.
+    assert all(keep for _, keep in seen)
+
+
+@respx.mock
+def test_on_segment_reports_every_sealed_chunk(respx_mock, tmp_path):
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    seen = []
+    run_live(_opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+             MayuraTranslator(settings), status=lambda m: None,
+             capture_factory=factory,
+             on_segment=lambda seg, keep: seen.append((seg.status, keep)))
+    # Whatever the ok/silence mix, the callback must be told about every sealed
+    # chunk — including any silence the writer drops — or a live view freezes
+    # during a quiet stretch and looks broken.
+    assert seen, "on_segment must fire at least once"
+    assert all(isinstance(keep, bool) for _, keep in seen)
+
+
+@respx.mock
+def test_on_segment_exception_does_not_end_the_run(respx_mock, tmp_path):
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    calls = []
+
+    def boom(seg, keep):
+        calls.append(1)
+        raise RuntimeError("ui rendering bug")
+
+    code = run_live(_opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+                    MayuraTranslator(settings), status=lambda m: None,
+                    capture_factory=factory, on_segment=boom)
+    assert calls, "the raising callback must actually have been called"
+    # A UI bug must not kill a meeting that is being transcribed.
+    assert code == 0
+    text = (tmp_path / "meeting.md").read_text(encoding="utf-8")
+    assert "Bravo" in text and "Vanakkam" in text
+
+
+@respx.mock
+def test_stop_event_stops_the_run(respx_mock, tmp_path):
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    stop = threading.Event()
+    seen = []
+
+    def on_segment(seg, keep):
+        seen.append(seg)
+        stop.set()  # stop after the first row, like a user pressing Stop
+
+    code = run_live(_opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+                    MayuraTranslator(settings), status=lambda m: None,
+                    capture_factory=factory,
+                    on_segment=on_segment, stop_event=stop)
+    assert stop.is_set()
+    assert len(seen) < 3, "stopping after the first row must cut the run short"
+    # Whatever was captured is still a valid, finalized file.
+    assert (tmp_path / "meeting.md").exists()
+    assert "· growing" not in (tmp_path / "meeting.md").read_text(encoding="utf-8")
+
+
+@respx.mock
+def test_run_live_works_off_the_main_thread(respx_mock, tmp_path):
+    # The regression test for the SIGINT guard: signal.signal() raises
+    # ValueError off the main thread, which is exactly how the UI calls it.
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    box = {}
+
+    def worker():
+        try:
+            box["code"] = run_live(
+                _opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+                MayuraTranslator(settings), status=lambda m: None,
+                capture_factory=factory,
+                on_segment=lambda seg, keep: None)
+        except BaseException as exc:  # noqa: BLE001 - surfaced in the assert
+            box["error"] = exc
+
+    th = threading.Thread(target=worker)
+    th.start()
+    th.join(timeout=120)
+    assert not th.is_alive(), "run_live hung when driven from a worker thread"
+    assert "error" not in box, f"run_live raised off the main thread: {box.get('error')!r}"
+    assert box["code"] == 0
