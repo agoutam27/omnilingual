@@ -30,9 +30,11 @@ def test_ui_package_is_not_imported_by_the_cli():
     `from . import ui` is correctly resolved to `omnilingual.ui` relative to
     the importing file's package, and `from omnilingual.ui import X` is caught.
 
-    The current `p.parent.name != "ui"` only excluded files directly in
-    `omnilingual/ui/`.  This version excludes any file whose path contains
-    `/ui/` anywhere, and resolves relative imports properly.
+    The guard excludes any file whose path (relative to the package root)
+    contains `/ui/`, and resolves relative imports by ascending the correct
+    number of package levels so that `from . import ui` from `cli.py` maps to
+    `omnilingual.ui` while `from . import ui` from `audio/` maps to
+    `omnilingual.audio.ui` (not the target).
     """
     import re
 
@@ -40,20 +42,36 @@ def test_ui_package_is_not_imported_by_the_cli():
     cli_dir = REPO / "omnilingual"
 
     def _is_under_ui(filepath: Path) -> bool:
-        """True if the file lives anywhere under omnilingual/ui/."""
-        parts = filepath.parts
-        return "/ui/" in filepath.as_posix() or "\\ui\\" in filepath.as_posix()
+        """True if the file lives anywhere under omnilingual/ui/ (relative to repo root)."""
+        try:
+            rel = filepath.relative_to(REPO)
+        except ValueError:
+            return False
+        return "/ui/" in rel.as_posix() or "\\ui\\" in rel.as_posix()
 
-    def _imports_omnilingual_ui(source: str, file_path: Path) -> bool:
-        """Return True if *source* contains an import of omnilingual.ui.
+    def _resolve_pkg_relative(pkg_parts, dots):
+        """Resolve the package after ascending `dots` levels.
 
-        Handles:
-        - `import omnilingual.ui`
-        - `from omnilingual.ui import X`
-        - `from omnilingual import ui`  (imports the ui subpackage from omnilingual)
-        - `from . import ui`  (resolved relative to file_path's package)
-        - `from .. import ui`  (resolved relative to file_path's package)
+        e.g. from . import ui from cli.py (pkg_parts=("omnilingual",), dots=1)
+        -> "omnilingual"; from . import ui from audio/foo.py -> "omnilingual";
+        from .. import ui from audio/live.py -> "omnilingual".
         """
+        if dots <= 0 or dots > len(pkg_parts):
+            return ""
+        resolved = pkg_parts[: len(pkg_parts) - dots + 1]
+        return ".".join(resolved)
+
+    def _imports_omnilingual_ui(source, file_path):
+        """Return True if *source* contains an import of omnilingual.ui."""
+        try:
+            rel = file_path.relative_to(REPO)
+        except ValueError:
+            return False
+
+        pkg_parts = rel.parent.parts
+        if not pkg_parts:
+            return False
+
         # Absolute import: import omnilingual.ui or from omnilingual.ui import ...
         if re.search(r"\bimport\s+omnilingual\.ui\b", source):
             return True
@@ -63,51 +81,41 @@ def test_ui_package_is_not_imported_by_the_cli():
         if re.search(r"\bfrom\s+omnilingual\s+import\s+ui\b", source):
             return True
 
-        # Relative imports: from . import ui  or  from .. import ui etc.
-        # Determine the package name from the file's parent directories.
-        # e.g. /path/omnilingual/cli.py -> package is "omnilingual"
-        #      /path/omnilingual/omnilingual/cli.py -> package is "omnilingual" (nested)
-        try:
-            rel = file_path.relative_to(REPO)
-            # Get the package part (all but the filename)
-            pkg_parts = rel.parent.parts
-            if not pkg_parts:
-                return False
-            # Build the dotted package name up to the parent dir
-            pkg_name = ".".join(pkg_parts)
-            # Map relative level: from . = 1 level up, from .. = 2 levels up, etc.
-            # We look for patterns like `from . import ui`, `from .. import ui`
-            for m in re.finditer(r"\bfrom\s+(\.+)\s+import\s+ui\b", source):
-                dots = len(m.group(1))
-                # Go up `dots` levels from the current package
-                pkg_parts_list = list(pkg_parts)
-                if len(pkg_parts_list) > dots:
-                    resolved_pkg = ".".join(pkg_parts_list[:-dots])
-                else:
-                    # If we go past the root, it's a top-level package
-                    resolved_pkg = ""
-                if resolved_pkg and f"{resolved_pkg}.ui" == "omnilingual.ui":
-                    return True
-                # Also check if the resolved package itself is "ui" within omnilingual
-                # e.g. from . import ui when current file is in omnilingual.cli
-                # resolves to omnilingual.ui
-                if resolved_pkg == "omnilingual" and dots == 1:
-                    # from . import ui when file is in omnilingual/ -> omnilingual.ui
-                    return True
-        except ValueError:
-            pass
+        # --- from . import ui  (single dot) ---
+        for m in re.finditer(r"\bfrom\s+(\.+)\s+import\s+ui\b", source):
+            dots = len(m.group(1))
+            resolved_pkg = _resolve_pkg_relative(pkg_parts, dots)
+            if resolved_pkg and f"{resolved_pkg}.ui" == "omnilingual.ui":
+                return True
+            if resolved_pkg == "omnilingual" and dots == 1:
+                return True
+
+        # --- from .ui import X  (ui as subpackage of current package) ---
+        if re.search(r"\bfrom\s+\.ui\s+import\b", source):
+            resolved_pkg = _resolve_pkg_relative(pkg_parts, 1)
+            if resolved_pkg and f"{resolved_pkg}.ui" == "omnilingual.ui":
+                return True
+
+        # --- from ..ui import X  (ui as subpackage of parent package) ---
+        if re.search(r"\bfrom\s+\.\.ui\s+import\b", source):
+            resolved_pkg = _resolve_pkg_relative(pkg_parts, 2)
+            if resolved_pkg and f"{resolved_pkg}.ui" == "omnilingual.ui":
+                return True
 
         return False
 
-    offenders: list[str] = []
+    offenders = []
     for p in cli_dir.rglob("*.py"):
         # Skip files under ui/ — those are the UI package itself
         if _is_under_ui(p):
             continue
         try:
             source = p.read_text(encoding="utf-8")
-        except Exception:
+        except (PermissionError, OSError):
+            offenders.append(f"{p.name} (unreadable)")
             continue
+        except Exception:
+            raise
         if _imports_omnilingual_ui(source, p):
             offenders.append(p.name)
 
