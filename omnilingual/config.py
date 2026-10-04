@@ -34,6 +34,10 @@ DEFAULT_MT_MODELS: dict[str, str] = {
     "indictrans2": "adalat-ai/ct2-rotary-indictrans2-indic-en-dist-200M",
 }
 
+# Sarvam's synchronous speech-to-text endpoint rejects audio of 30 seconds or
+# more, which is what makes a ceiling necessary rather than arbitrary.
+MAX_CHUNK_LIMIT_S = 30.0
+
 # Per-model input caps, in characters. Mayura rejects long inputs, so it is the
 # tightest. Gemini's context window is orders of magnitude larger, so bigger
 # pieces mean fewer requests and more context to resolve pronouns within a chunk.
@@ -139,3 +143,26 @@ def load_settings(
             f"num_speakers must be at least 2, got {settings.num_speakers}"
         )
     return settings
+
+
+def validate_chunk_bounds(min_chunk_s: float, max_chunk_s: float) -> None:
+    """Raise ConfigError unless these bounds can produce valid chunks.
+
+    Lives in config rather than cli so the CLI and the UI enforce one rule; two
+    copies of a numeric bound drift. The message keeps the flag wording because
+    tests and users both read it as a CLI diagnostic.
+    """
+    if (not 0 < min_chunk_s < max_chunk_s < MAX_CHUNK_LIMIT_S
+            or max_chunk_s < 2 * min_chunk_s):
+        raise ConfigError(
+            "--max-chunk-s must be < 30 and > --min-chunk-s, and at least 2x "
+            f"--min-chunk-s (got {min_chunk_s:g} and {max_chunk_s:g})")
+
+
+def validate_target_s(target_s: float, min_chunk_s: float,
+                      max_chunk_s: float) -> None:
+    """Raise ConfigError unless the live target chunk length fits the bounds."""
+    if not min_chunk_s <= target_s <= max_chunk_s:
+        raise ConfigError(
+            "--target-s must be between --min-chunk-s and --max-chunk-s "
+            f"(got {target_s:g}, {min_chunk_s:g} and {max_chunk_s:g})")

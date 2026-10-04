@@ -28,7 +28,7 @@ from omnilingual.audio.live_capture import (
 )
 from omnilingual.audio.normalize import FfmpegError, FfmpegMissingError, ensure_ffmpeg
 from omnilingual.cache import JsonCache
-from omnilingual.config import ConfigError, load_settings
+from omnilingual.config import ConfigError, load_settings, validate_chunk_bounds, validate_target_s
 from omnilingual.http import AuthError, QuotaError, SarvamError
 from omnilingual.models import Cost, Segment, chunks_from_json
 from omnilingual.pipeline import LIVE_SESSION_KIND, estimate, prepare, run, run_from_chunks, work_dir_for
@@ -57,10 +57,6 @@ class _AppGroup(typer.core.TyperGroup):
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, cls=_AppGroup)
 console = Console()
-
-
-# Sarvam's synchronous speech-to-text endpoint rejects audio of 30 seconds or more.
-MAX_CHUNK_LIMIT_S = 30.0
 
 
 def _fail(msg: str, code: int = 1) -> NoReturn:
@@ -333,8 +329,10 @@ def transcribe(
 
     # Bad chunk bounds would only surface after normalizing the whole recording, or
     # worse, as a wall of 400s from the API. Check them before doing any work.
-    if not 0 < min_chunk_s < max_chunk_s < MAX_CHUNK_LIMIT_S or max_chunk_s < 2 * min_chunk_s:
-        _fail("--max-chunk-s must be < 30 and > --min-chunk-s, and at least 2x --min-chunk-s")
+    try:
+        validate_chunk_bounds(min_chunk_s, max_chunk_s)
+    except ConfigError as exc:
+        _fail(str(exc))
 
     # An unwritable output path must not be discovered after paying for transcription.
     try:
@@ -425,10 +423,11 @@ def live(
     err = Console(stderr=True)
     say = lambda m: err.print(m, markup=False)  # brackets must not render
     logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING)
-    if not 0 < min_chunk_s < max_chunk_s < MAX_CHUNK_LIMIT_S or max_chunk_s < 2 * min_chunk_s:
-        _fail("--max-chunk-s must be < 30 and > --min-chunk-s, and at least 2x --min-chunk-s")
-    if not min_chunk_s <= target_s <= max_chunk_s:
-        _fail("--target-s must be between --min-chunk-s and --max-chunk-s")
+    try:
+        validate_chunk_bounds(min_chunk_s, max_chunk_s)
+        validate_target_s(target_s, min_chunk_s, max_chunk_s)
+    except ConfigError as exc:
+        _fail(str(exc))
     if stt_workers < 1:
         _fail("--stt-workers must be >= 1")
     if ask:

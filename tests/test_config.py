@@ -1,6 +1,12 @@
 import pytest
 
-from omnilingual.config import ConfigError, Settings, load_settings
+from omnilingual.config import (
+    ConfigError,
+    Settings,
+    load_settings,
+    validate_chunk_bounds,
+    validate_target_s,
+)
 
 
 def test_load_settings_reads_key_from_env():
@@ -99,3 +105,40 @@ def test_settings_is_frozen():
     s = load_settings(env={})
     with pytest.raises(Exception):
         s.api_key = "x"  # type: ignore[misc]
+
+
+def test_validate_chunk_bounds_accepts_cli_defaults():
+    validate_chunk_bounds(5.0, 28.0)
+
+
+@pytest.mark.parametrize("mins,maxs", [
+    (0.0, 28.0),      # min not positive
+    (-1.0, 28.0),     # min negative
+    (5.0, 4.0),       # max below min
+    (5.0, 5.0),       # max == min
+    (5.0, 30.0),      # max at the Sarvam ceiling
+    (5.0, 40.0),      # max above the ceiling
+    (5.0, 9.0),       # max < 2x min
+])
+def test_validate_chunk_bounds_rejects(mins, maxs):
+    with pytest.raises(ConfigError):
+        validate_chunk_bounds(mins, maxs)
+
+
+def test_validate_chunk_bounds_message_keeps_cli_wording():
+    # tests/test_cli_live.py asserts on this substring, so the wording is load-bearing.
+    with pytest.raises(ConfigError) as exc:
+        validate_chunk_bounds(5.0, 40.0)
+    assert "--max-chunk-s must be < 30" in str(exc.value)
+
+
+def test_validate_target_s_accepts_value_inside_bounds():
+    validate_target_s(8.0, 5.0, 28.0)
+    validate_target_s(5.0, 5.0, 28.0)
+    validate_target_s(28.0, 5.0, 28.0)
+
+
+@pytest.mark.parametrize("target", [4.9, 28.1])
+def test_validate_target_s_rejects_outside_bounds(target):
+    with pytest.raises(ConfigError):
+        validate_target_s(target, 5.0, 28.0)
