@@ -218,11 +218,51 @@ def test_present_reports_all_false_for_a_non_utf8_file(tmp_path, monkeypatch):
     """A .env that is not UTF-8 reads as no keys, not as a crash.
 
     UnicodeDecodeError is a ValueError, not an OSError, so catching only OSError
-    made a stray latin-1 byte in a comment take the whole panel down.
+    made a stray latin-1 byte in a comment take the whole panel down. The panel
+    must still open here, so this stays a read that reports nothing rather than
+    an error the caller has to handle.
     """
     path = _redirect(monkeypatch, tmp_path)
-    path.write_bytes(b"# caf\xe9\nGROQ_API_KEY=g\n")
+    path.write_bytes(b"# caf\xe9\nGROQ_API_KEY=groq-real\nSARVAM_API_KEY=sarvam-real\n")
     assert secrets.present() == dict.fromkeys(secrets.KEYS, False)
+
+
+UNREADABLE = b"# caf\xe9 latin-1\nGROQ_API_KEY=groq-real\nSARVAM_API_KEY=sarvam-real\n"
+
+
+def test_set_key_refuses_an_undecodable_env_and_leaves_every_byte(tmp_path, monkeypatch):
+    """An undecodable .env holds keys this process never saw; rewriting drops them.
+
+    Treating it as an empty file reduced a 73-byte .env holding two live keys to
+    the single line `SARVAM_API_KEY=new`, silently and with no error. Refusing is
+    the only safe answer: never write to a file you could not read.
+    """
+    path = _redirect(monkeypatch, tmp_path)
+    path.write_bytes(UNREADABLE)
+    with pytest.raises(ValueError):
+        secrets.set_key("SARVAM_API_KEY", "new")
+    assert path.read_bytes() == UNREADABLE
+
+
+def test_clear_refuses_an_undecodable_env_and_leaves_every_byte(tmp_path, monkeypatch):
+    path = _redirect(monkeypatch, tmp_path)
+    path.write_bytes(UNREADABLE)
+    with pytest.raises(ValueError):
+        secrets.clear("GROQ_API_KEY")
+    assert path.read_bytes() == UNREADABLE
+
+
+def test_the_undecodable_env_error_names_the_key_but_never_the_file(tmp_path, monkeypatch):
+    """The message reaches an HTTP client as a 400 body, so it must carry no secret."""
+    path = _redirect(monkeypatch, tmp_path)
+    path.write_bytes(UNREADABLE)
+    with pytest.raises(ValueError) as exc:
+        secrets.set_key("GROQ_API_KEY", "new")
+    message = str(exc.value)
+    assert "GROQ_API_KEY" in message
+    assert "groq-real" not in message
+    assert "sarvam-real" not in message
+    assert "latin-1" not in message
 
 
 def test_set_key_trims_a_pasted_value(env_file):

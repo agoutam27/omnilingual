@@ -8,7 +8,7 @@ appending a duplicate or leaving a stale one, mode 0600, write atomically. That
 shell implementation cannot be imported, so this is a cross-language duplication
 of a small invariant set; if one changes, change both.
 
-Three deliberate divergences from the shell, all applied uniformly across
+Four deliberate divergences from the shell, all applied uniformly across
 present/set_key/clear so the three can never disagree about which lines belong
 to a key:
 
@@ -20,6 +20,12 @@ to a key:
   - A CRLF .env keeps its \r on every line except the one just written, which
     takes env_set's plain \n. Lines are split on \n alone for the same reason:
     str.splitlines() would rewrite the whole file's line endings.
+  - An .env that exists but is not UTF-8 is refused by set_key and clear, while
+    present() reports every key absent. env_set is byte-transparent here — sed
+    never decodes, so it rewrites the key's line and copies the rest verbatim,
+    bad bytes and all. Python cannot do that: its rewrite goes through a decode,
+    so the only faithful options are to discard what it cannot read or to refuse.
+    Refusing is the one that cannot lose a key.
 """
 
 from __future__ import annotations
@@ -54,7 +60,14 @@ def _unquote(value: str) -> str:
     return value
 
 
-def _lines() -> list[str]:
+def _lines() -> list[str] | None:
+    """The .env's lines, or None when it exists but cannot be decoded.
+
+    None is deliberately distinct from []. [] means "absent or empty", which a
+    writer may create or replace. None means the bytes are there and are not
+    ours to interpret: a writer must refuse rather than replace a file whose
+    keys it never read.
+    """
     try:
         # newline="" disables universal-newline translation. read_text() would
         # rewrite \r\n to \n on the way in, and no split() can preserve a \r that
@@ -62,12 +75,15 @@ def _lines() -> list[str]:
         # every line ending in a CRLF .env.
         with env_path().open("r", encoding="utf-8", newline="") as fh:
             text = fh.read()
-    except (OSError, ValueError):
-        # ValueError is the UnicodeDecodeError of a .env that is not UTF-8, which
-        # is not an OSError and would otherwise escape every caller.
+    except FileNotFoundError:
+        return []
+    except ValueError:
+        # UnicodeDecodeError, and not an OSError: the file exists and is not UTF-8.
+        return None
+    except OSError:
         return []
     # Split on \n alone. str.splitlines() also breaks on \r, \x0b, \x0c, \x85 and
-    # \u2028, so a \u2028 inside a value split one line into two and injected
+    # \u2028, so a \u2028 inside a value split one line into two and injected the
     # tail as an orphan line on the next write. One trailing "" means the file
     # ended with a newline; drop just that.
     lines = text.split("\n")
@@ -82,8 +98,12 @@ def present() -> dict[str, bool]:
     The last matching line decides, like env_get's `tail -n 1` and like the
     dotenv loader `uv run --env-file` uses, so this answers "would the run see
     this key" rather than "does some line mention it".
+
+    An undecodable .env reports every key absent rather than raising: the read
+    path exists so the panel can open, and refusing to open would be worse than
+    showing a key the user can then re-enter.
     """
-    lines = _lines()
+    lines = _lines() or []
     found: dict[str, bool] = {}
     for name in KEYS:
         value = ""
@@ -106,6 +126,10 @@ def set_key(name: str, value: str) -> None:
     case, and a newline followed by more content would silently add a second key
     to the file the CLI loads. So trim, then refuse anything still multiline.
     The error names the key only: a value must never reach a log or a traceback.
+
+    Refuses outright when the .env exists but cannot be decoded. Treating that as
+    an empty file rewrote it, discarding keys this process never read — silent,
+    unrecoverable credential loss.
     """
     if name not in KEYS:
         raise ValueError(f"unknown key: {name}")
@@ -113,6 +137,8 @@ def set_key(name: str, value: str) -> None:
     if "\n" in value or "\r" in value:
         raise ValueError(f"value for {name} must be a single line")
     lines = _lines()
+    if lines is None:
+        raise ValueError(f"cannot set {name}: the .env is not valid UTF-8")
     pattern = _assign(name)
     replaced = False
     for index, line in enumerate(lines):
@@ -125,10 +151,17 @@ def set_key(name: str, value: str) -> None:
 
 
 def clear(name: str) -> None:
-    """Remove a key's line. A no-op when the key is not there."""
+    """Remove a key's line. A no-op when the key is not there.
+
+    Raises on an undecodable .env rather than treating it as empty. Filtering an
+    empty list would have been a safe no-op by luck, not by design, and the
+    distinction has to be explicit so it stays safe.
+    """
     if name not in KEYS:
         raise ValueError(f"unknown key: {name}")
     lines = _lines()
+    if lines is None:
+        raise ValueError(f"cannot clear {name}: the .env is not valid UTF-8")
     pattern = _assign(name)
     kept = [line for line in lines if not pattern.match(line)]
     if len(kept) != len(lines):
