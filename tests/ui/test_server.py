@@ -20,6 +20,7 @@ import threading
 import time
 
 import pytest
+pytest.importorskip("fastapi", reason="the ui extra is not installed")
 from fastapi.testclient import TestClient
 
 from omnilingual.ui import server
