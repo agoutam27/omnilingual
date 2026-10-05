@@ -132,6 +132,7 @@ class FakeRunner:
         self.loop = loop
         self.calls: list[tuple[str, dict]] = []
         self.status = "running"
+        self.stops = 0
         self._out = None
         self._session_dir = None
 
@@ -151,6 +152,7 @@ class FakeRunner:
 
     def stop(self):
         """Only a live run can be stopped, so only a live run reports stopping."""
+        self.stops += 1
         if self.calls and self.calls[0][0] == "live":
             self.status = "stopping"
 
@@ -188,6 +190,31 @@ def fake_runs(api, monkeypatch):
     monkeypatch.setattr(server, "ensure_ffmpeg", lambda: None)
     monkeypatch.setattr(audio, "probe", lambda *a, **k: _readiness())
     return api
+
+
+def _isolate_work_dir(client, token, tmp_path, *, name="work"):
+    """Point the stored panel at a work directory this test owns.
+
+    /api/runs reads the work directory on disk (§7: recent runs from the live-*
+    session dirs), so a test that says what it expects to find has to say where it
+    is looking. Without this, every runs test asserted on whatever the developer's
+    own repo happened to hold — which is why the two below used to pass.
+    """
+    root = tmp_path / name
+    root.mkdir(parents=True, exist_ok=True)
+    client.put("/api/settings", headers=_ok(token), json={"work_dir": str(root)})
+    return root
+
+
+def _saved_session(root, stamp, *, chunk=True, marker=True):
+    """A live-* session dir on disk, exactly as run_live leaves one."""
+    directory = root / f"live-{stamp}"
+    (directory / "live-chunks").mkdir(parents=True, exist_ok=True)
+    if marker:
+        (directory / "session.json").write_text('{"kind": "live"}', encoding="utf-8")
+    if chunk:
+        (directory / "live-chunks" / "0001.wav").write_bytes(b"RIFF")
+    return directory
 
 
 def _runner(client, run_id=None):
@@ -268,6 +295,77 @@ def test_localhost_host_header_is_allowed(api):
                      headers={"X-Omnilingual-Token": token,
                               "Host": f"localhost:{PORT}"})
     assert res.status_code == 200
+
+
+# A near-miss is the only thing that pins an exact comparison. "not-the-token" is
+# not a near miss: it shares nothing with a real token, so it stays rejected under
+# every way of comparing two strings loosely.
+@pytest.mark.parametrize("truncation", [
+    lambda t: t[:-1],          # one character short
+    lambda t: t[:8],           # a prefix
+    lambda t: t + "x",         # a token plus one character
+    lambda t: t.upper(),       # case-folded
+])
+def test_a_token_that_is_nearly_right_is_forbidden(api, truncation):
+    client, token = api
+    res = client.get("/api/defaults", headers=_ok(truncation(token)))
+    assert res.status_code == 403
+    assert res.json()["error"] == "bad token"
+
+
+def test_a_loopback_origin_on_another_port_is_rejected(api):
+    """127.0.0.1 on a different port is a different origin, and some other local
+    process could be serving it. A prefix match on the scheme would let this
+    window's token travel there."""
+    client, token = api
+    res = client.get("/api/defaults",
+                     headers=_ok(token, Origin="http://127.0.0.1:62345"))
+    assert res.status_code == 403
+    assert res.json()["error"] == "bad origin"
+
+
+def test_a_host_header_on_another_port_is_rejected(api):
+    client, token = api
+    res = client.get("/api/defaults",
+                     headers={"X-Omnilingual-Token": token,
+                              "Host": "127.0.0.1:62345"})
+    assert res.status_code == 403
+    assert res.json()["error"] == "bad host"
+
+
+def test_an_app_that_was_not_told_its_port_answers_a_normal_request(env):
+    """create_app(port=None) is the launcher that does not know the port yet.
+
+    Reading that as port 0 made every request demand "Host: 127.0.0.1:0" and the
+    app refused everything it was ever sent — a silent brick, since it looked like
+    a server that was up.
+    """
+    token = mint_token()
+    client = TestClient(create_app(token=token, port=None))
+    for host in (HOST, "localhost:5599", "127.0.0.1:62345"):
+        res = client.get("/api/keys",
+                         headers={"X-Omnilingual-Token": token, "Host": host})
+        assert res.status_code == 200, host
+        assert res.json() == {"SARVAM_API_KEY": False, "GROQ_API_KEY": False,
+                              "GEMINI_API_KEY": False}
+
+
+def test_an_app_with_no_port_is_still_loopback_only(env):
+    token = mint_token()
+    client = TestClient(create_app(token=token, port=None))
+    for host in ("evil.example", "127.0.0.1", "attacker.example:5599"):
+        res = client.get("/api/keys",
+                         headers={"X-Omnilingual-Token": token, "Host": host})
+        assert res.status_code == 403, host
+
+
+def test_an_app_with_no_port_still_demands_its_token(env):
+    token = mint_token()
+    client = TestClient(create_app(token=token, port=None))
+    assert client.get("/api/keys", headers={"Host": HOST}).status_code == 403
+    assert client.get("/api/keys",
+                      headers={"X-Omnilingual-Token": "no", "Host": HOST}
+                      ).status_code == 403
 
 
 @pytest.mark.parametrize(("method", "path"), RESERVED)
@@ -816,6 +914,85 @@ def test_start_reports_a_missing_ffmpeg_before_it_starts_a_run(api, env, monkeyp
     assert _state(client).runs == {}
 
 
+def _hide_extra(monkeypatch, package):
+    """Make importlib.util.find_spec report one optional dependency as absent.
+
+    find_spec is how all four local providers check for their extra, so this walks
+    the real missing-extra path rather than a stubbed one: whatever the provider
+    does about the absence is what the route has to answer.
+    """
+    import importlib.util
+
+    real = importlib.util.find_spec
+
+    def find_spec(name, *args, **kwargs):
+        return None if name == package else real(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+
+
+# §13: "Missing extra — detected at start; renders as 'Run Setup to add speaker
+# diarization', a button, not a traceback." A 500 is the one answer the page cannot
+# turn into a button, so the contract is the status code and not the wording.
+@pytest.mark.parametrize(("package", "panel"), [
+    ("mlx_whisper", {"stt": "mlx-whisper"}),
+    ("ctranslate2", {"mt": "indictrans2"}),
+    ("sherpa_onnx", {"diarize": True}),
+])
+def test_a_missing_extra_is_a_refusal_not_a_traceback(api, env, monkeypatch, package,
+                                                      panel):
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    _hide_extra(monkeypatch, package)
+    monkeypatch.setattr(server, "SessionRunner", FakeRunner)
+    client, token = api
+    res = client.post("/api/session/start", headers=_ok(token),
+                      json=_start_body(**panel))
+    assert res.status_code == 400, res.text
+    assert "extra" in res.json()["error"]
+    assert _state(client).runs == {}
+
+
+def test_an_import_error_from_the_builder_is_also_a_refusal(api, env, monkeypatch):
+    """Belt and braces for the clause above.
+
+    Each of today's four providers wraps the absence as a ConfigError, so the
+    previous test cannot tell "the route answers a missing extra" from "the route
+    happens to answer these four ConfigErrors". A provider that let its own
+    ImportError out would be a 500, so the route has to catch the exception itself.
+    """
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    monkeypatch.setattr(server, "SessionRunner", FakeRunner)
+
+    def unbuildable(body):
+        raise ImportError("No module named 'ctranslate2'")
+
+    monkeypatch.setattr(server, "build_run", unbuildable)
+    client, token = api
+    res = client.post("/api/session/start", headers=_ok(token), json=_start_body())
+    assert res.status_code == 400, res.text
+    assert "ctranslate2" in res.json()["error"]
+    assert _state(client).runs == {}
+
+
+def test_recovery_refuses_a_missing_extra_rather_than_failing(api, env, tmp_path,
+                                                              monkeypatch):
+    """The same button on the recovery path: a replay needs its providers too."""
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    root = _isolate_work_dir(api[0], api[1], tmp_path)
+    saved = _saved_session(root, "20261005T000000000000Z")
+
+    def unbuildable(body):
+        raise ModuleNotFoundError("No module named 'ctranslate2'")
+
+    monkeypatch.setattr(server, "build_run", unbuildable)
+    client, token = api
+    res = client.post("/api/session/recover", headers=_ok(token),
+                      json={"session_dir": str(saved)})
+    assert res.status_code == 400, res.text
+    assert "ctranslate2" in res.json()["error"]
+    assert _state(client).runs == {}
+
+
 def test_start_refuses_a_live_run_when_the_device_is_absent(fake_runs, env,
                                                              monkeypatch):
     """§9: a live start that cannot capture is a 400 naming the remedy.
@@ -1172,14 +1349,16 @@ def test_stop_does_not_invent_a_stopping_state_for_a_recording(fake_runs, env,
 # --- runs and recovery -----------------------------------------------------
 
 
-def test_runs_endpoint_lists_nothing_before_a_run(api):
+def test_runs_endpoint_lists_nothing_before_a_run(api, tmp_path):
     client, token = api
+    _isolate_work_dir(client, token, tmp_path)
     assert client.get("/api/runs", headers=_ok(token)).json()["runs"] == []
 
 
 def test_runs_endpoint_reports_the_run(fake_runs, env, tmp_path):
     env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
     client, token = fake_runs
+    _isolate_work_dir(client, token, tmp_path)
     started = client.post("/api/session/start", headers=_ok(token),
                           json=_start_body(out=str(tmp_path / "a.md"))).json()
     runs = client.get("/api/runs", headers=_ok(token)).json()["runs"]
@@ -1187,6 +1366,118 @@ def test_runs_endpoint_reports_the_run(fake_runs, env, tmp_path):
     assert runs[0]["status"] == "running"
     assert runs[0]["out"] == str(tmp_path / "a.md")
     assert runs[0]["recoverable"] is False
+
+
+def test_runs_endpoint_surfaces_a_session_a_previous_window_left_behind(api, tmp_path):
+    """§7 asks for recent runs from the work directory's live-* session dirs.
+
+    Without them §8's "recovery is available even after a quit" is unreachable:
+    POST /api/session/recover needs a caller-supplied session_dir, and a freshly
+    launched window's registry is empty.
+    """
+    client, token = api
+    root = _isolate_work_dir(client, token, tmp_path)
+    saved = _saved_session(root, "20261005T054512123456Z")
+    entry, = client.get("/api/runs", headers=_ok(token)).json()["runs"]
+    assert entry == {"run_id": saved.name, "status": "done", "out": None,
+                     "session_dir": str(saved), "recoverable": True}
+
+
+def test_runs_endpoint_lists_the_newest_session_first(api, tmp_path):
+    client, token = api
+    root = _isolate_work_dir(client, token, tmp_path)
+    for stamp in ("20260101T000000000000Z", "20260601T000000000000Z",
+                  "20261005T000000000000Z"):
+        _saved_session(root, stamp)
+    runs = client.get("/api/runs", headers=_ok(token)).json()["runs"]
+    assert [r["run_id"] for r in runs] == [
+        "live-20261005T000000000000Z", "live-20260601T000000000000Z",
+        "live-20260101T000000000000Z"]
+
+
+def test_a_saved_session_with_no_sealed_chunk_is_not_offered_for_recovery(api, tmp_path):
+    """run_from_chunks refuses an empty manifest, so a Recover button that always
+    fails is worse than none. session.json alone does not prove a sealed chunk."""
+    client, token = api
+    root = _isolate_work_dir(client, token, tmp_path)
+    _saved_session(root, "20261005T000000000000Z", chunk=False)
+    entry, = client.get("/api/runs", headers=_ok(token)).json()["runs"]
+    assert entry["recoverable"] is False
+
+
+def test_a_directory_without_session_json_is_not_a_session(api, tmp_path):
+    client, token = api
+    root = _isolate_work_dir(client, token, tmp_path)
+    (root / "live-20261005T000000000000Z").mkdir()
+    assert client.get("/api/runs", headers=_ok(token)).json()["runs"] == []
+
+
+def test_a_saved_session_is_not_listed_next_to_the_run_that_owns_it(fake_runs, env,
+                                                                   tmp_path):
+    """The registry knows the live status and output path; the work tree knows only
+    that a directory exists. The run's own entry has to win, once."""
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    client, token = fake_runs
+    root = _isolate_work_dir(client, token, tmp_path)
+    saved = _saved_session(root, "20261005T000000000000Z")
+    started = client.post("/api/session/start", headers=_ok(token),
+                          json=_start_body(out=str(tmp_path / "a.md"))).json()
+    _runner(client)._session_dir = saved
+    runs = client.get("/api/runs", headers=_ok(token)).json()["runs"]
+    assert [r["run_id"] for r in runs] == [started["run_id"]]
+    assert runs[0]["status"] == "running"
+    assert runs[0]["out"] == str(tmp_path / "a.md")
+
+
+def test_the_saved_session_listing_is_capped(api, tmp_path):
+    """A work directory gains a directory per meeting and nothing ever prunes it."""
+    client, token = api
+    root = _isolate_work_dir(client, token, tmp_path)
+    newest = server._PAST_LIMIT + 5
+    for day in range(newest):
+        _saved_session(root, f"202601{day + 1:02d}T000000000000Z")
+    runs = client.get("/api/runs", headers=_ok(token)).json()["runs"]
+    assert len(runs) == server._PAST_LIMIT
+    assert runs[0]["run_id"] == f"live-202601{newest:02d}T000000000000Z"
+
+
+def test_recovery_reaches_a_session_from_before_this_window(fake_runs, env, tmp_path):
+    """The whole point of listing the saved sessions: the page posts the session_dir
+    it was shown and run_from_chunks replays it, with no run id from this process."""
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    client, token = fake_runs
+    root = _isolate_work_dir(client, token, tmp_path)
+    saved = _saved_session(root, "20261005T000000000000Z")
+    listed = [r for r in client.get("/api/runs", headers=_ok(token)).json()["runs"]
+              if r["run_id"] == saved.name]
+    res = client.post("/api/session/recover", headers=_ok(token),
+                      json={"session_dir": listed[0]["session_dir"]})
+    assert res.status_code == 200
+    assert res.json()["mode"] == "recover"
+    assert _runner(client).calls[0][0] == "recover"
+    assert _runner(client).calls[0][1]["session_dir"] == saved
+
+
+def test_recover_message_reaches_a_session_this_window_did_not_start(fake_runs, env,
+                                                                     tmp_path):
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    client, token = fake_runs
+    root = _isolate_work_dir(client, token, tmp_path)
+    saved = _saved_session(root, "20261005T000000000000Z")
+    with client.websocket_connect("/ws", headers=_ok(token)) as socket:
+        socket.receive_json()
+        socket.send_json({"type": "recover", "run_id": saved.name})
+    assert _runner(client).calls[0][0] == "recover"
+
+
+def test_recover_message_for_a_saved_session_with_no_chunks_is_ignored(api, tmp_path):
+    client, token = api
+    root = _isolate_work_dir(client, token, tmp_path)
+    empty = _saved_session(root, "20261005T000000000000Z", chunk=False)
+    with client.websocket_connect("/ws", headers=_ok(token)) as socket:
+        socket.receive_json()
+        socket.send_json({"type": "recover", "run_id": empty.name})
+    assert _state(client).runs == {}
 
 
 def test_recover_rejects_a_directory_that_is_not_a_session_dir(api, tmp_path):
@@ -1381,6 +1672,17 @@ def test_websocket_rejects_a_foreign_origin(api):
             pass
 
 
+def test_websocket_rejects_a_cross_port_loopback_origin(api):
+    """The handshake is the one request a cross-site page can make with no preflight,
+    so it repeats the origin check — and a loopback origin on another port is a
+    different origin, served by whatever else is listening on this machine."""
+    client, token = api
+    with pytest.raises(Exception):
+        with client.websocket_connect("/ws",
+                                      headers=_ok(token, Origin="http://127.0.0.1:62345")):
+            pass
+
+
 def test_websocket_accepts_the_token_as_a_query_parameter(api):
     """The browser WebSocket API cannot set a header on the handshake."""
     client, token = api
@@ -1424,20 +1726,79 @@ def test_websocket_relays_queued_events(api):
     assert kinds == ["status", "segment", "log", "end"]
 
 
-def test_a_websocket_disconnect_does_not_kill_the_run(fake_runs, env, tmp_path):
+async def _disconnect(app, *, token):
+    """Hand the app one websocket connect and then a disconnect, and await its return.
+
+    TestClient cannot be used for this. Its session context manager exits through
+    close(1000) -> portal.call(cs.cancel), and that call resolves at
+    task_status.started(): the app coroutine is cancelled from outside and never
+    runs its own teardown. A test written against TestClient therefore asserts about
+    whatever Starlette happens to await, not about this app's disconnect path.
+    Calling the ASGI app directly and awaiting it is the only way to see that the
+    handler finished its own way out.
+    """
+    scope = {
+        "type": "websocket", "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1", "scheme": "ws", "server": ("127.0.0.1", PORT),
+        "client": ("127.0.0.1", 53123), "root_path": "", "path": "/ws",
+        "raw_path": b"/ws", "query_string": b"",
+        "headers": [(b"host", HOST.encode()),
+                    (b"x-omnilingual-token", token.encode()),
+                    (b"origin", f"http://127.0.0.1:{PORT}".encode())],
+    }
+    inbound = [{"type": "websocket.connect"},
+               {"type": "websocket.disconnect", "code": 1000, "reason": ""}]
+    sent = []
+
+    async def receive():
+        if inbound:
+            return inbound.pop(0)
+        # Nothing left to hand over: hold the handler open rather than spinning, so
+        # a handler that never notices the disconnect fails on the timeout instead
+        # of hanging the suite.
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    async def send(message):
+        sent.append(message)
+
+    await asyncio.wait_for(app(scope, receive, send), 10)
+    return sent
+
+
+def test_the_disconnect_path_never_touches_a_runner(fake_runs, env, tmp_path):
+    """Constraint 6: closing the window must not destroy a transcription in progress.
+
+    Asserted against the app's own disconnect path, which is why this drives the
+    ASGI app rather than a TestClient socket — see _disconnect.
+    """
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    client, token = fake_runs
+    client.post("/api/session/start", headers=_ok(token),
+                json=_start_body(out=str(tmp_path / "a.md")))
+    runner = _runner(client)
+    sent = asyncio.run(_disconnect(client.app, token=token))
+    assert [m["type"] for m in sent] == ["websocket.accept", "websocket.send"]
+    assert runner.stops == 0
+    assert runner.status == "running"
+    assert _state(client).runs[runner.run_id] is runner
+
+
+def test_a_reconnecting_page_still_finds_the_run(fake_runs, env, tmp_path):
     """The run lives in the server; the page is only a reader of it."""
     env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
     client, token = fake_runs
+    _isolate_work_dir(client, token, tmp_path)
     started = client.post("/api/session/start", headers=_ok(token),
                           json=_start_body(out=str(tmp_path / "a.md"))).json()
     with client.websocket_connect("/ws", headers=_ok(token)) as socket:
         assert socket.receive_json()["status"] == "running"
-    # The window closed mid-meeting; the run must still be there and still running.
-    assert _state(client).runs[started["run_id"]].status == "running"
+    runner = _runner(client, started["run_id"])
+    assert runner.status == "running"
     with client.websocket_connect("/ws", headers=_ok(token)) as socket:
         assert socket.receive_json()["status"] == "running"
-    assert client.get("/api/runs", headers=_ok(token)).json()["runs"][0][
-        "run_id"] == started["run_id"]
+    runs = client.get("/api/runs", headers=_ok(token)).json()["runs"]
+    assert started["run_id"] in [r["run_id"] for r in runs]
 
 
 def test_events_emitted_with_no_page_attached_are_kept_for_the_next_one(fake_runs, env,

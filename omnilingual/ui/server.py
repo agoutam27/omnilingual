@@ -64,7 +64,12 @@ TOKEN_HEADER = "X-Omnilingual-Token"
 
 # The run states that mean the window is taken. 'done' is not one of them even when
 # exit_code was 2: the file is written and some segments failed, which is a finished
-# run. 'halted' is, because capture went on after the API calls stopped.
+# run. 'halted' is not one of them either, and that is the surprising one: a halt is
+# set inside session._finish, which only runs once run_live has *returned*, so by the
+# time a run reads 'halted' its capture thread is already gone. It is a terminal state
+# that happens to be worth recovering, which is a different question from whether the
+# window is free — run_from_chunks replays the sealed chunks, and nothing about a halt
+# needs a second run competing for the one window.
 _BUSY_STATUSES = frozenset({"running", "stopping"})
 
 # What a live panel's 'out' field means when the user cleared it, and what a
@@ -76,6 +81,22 @@ _RECOVERED_OUT = Path("recovered.md")
 # Same-origin, read-only, and needed before the page has a token, so they answer
 # without one. Everything else under /api/ is token-guarded.
 _UNGUARDED = frozenset({"/api/health", "/token.js", "/"})
+
+# The two names a loopback request may arrive under. localhost is another spelling
+# of 127.0.0.1, not another machine.
+_LOOPBACK = ("127.0.0.1", "localhost")
+
+# How a saved live session is recognised on disk. run_live names every session
+# live-<UTC stamp> under the work root and writes session.json into it before it
+# opens the capture, so the two together are the whole naming contract — the same
+# pair session.py differs the work root on to attribute a finished run.
+_SESSION_GLOB = "live-*"
+_SESSION_MARKER = "session.json"
+
+# How many saved sessions /api/runs will answer with. A work directory accumulates
+# one directory per meeting and nothing ever prunes it, so the answer is capped
+# rather than growing for as long as the app has been installed.
+_PAST_LIMIT = 20
 
 # What a live start needs before it is worth answering 200, each with the fix the
 # page offers next to it (§9). Named rather than reused from probe's `detail`,
@@ -111,7 +132,10 @@ class AppState:
     """What one window owns. Lives on app.state.ui, so tests reach it from there."""
 
     token: str
-    port: int
+    # The port this server is reachable at, or None when the launcher has not said.
+    # None does not mean "port 0": it means the port half of the Host and Origin
+    # checks is not yet known, so any loopback port is legal.
+    port: int | None
     runs: dict[str, SessionRunner] = field(default_factory=dict)
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     loop: asyncio.AbstractEventLoop | None = None
@@ -139,6 +163,86 @@ def _idle_state() -> dict:
             "out": None, "session_dir": None, "error": None}
 
 
+# --- hosts, and the runs this window can talk about --------------------------
+
+
+def _authority(url: str) -> tuple[str, str] | None:
+    """A Host or Origin authority split into (host, port), or None if it is not one.
+
+    The port is required rather than optional: "127.0.0.1" with no port is not the
+    URL this server is reachable at, and a request naming it is not coming from the
+    window. isascii keeps non-ASCII digits out, which str.isdigit() would otherwise
+    wave through and turn into a port comparison against something meaningless.
+    """
+    host, sep, port = url.rpartition(":")
+    if not sep or not host or not (port.isascii() and port.isdigit()):
+        return None
+    return host, port
+
+
+def _past_sessions() -> list[dict]:
+    """The live sessions in the work directory, newest first.
+
+    §7 asks /api/runs for recent runs from the work directory's live-* session
+    dirs, and §8's "recovery is available even after a quit" is unreachable without
+    them: POST /api/session/recover needs a caller-supplied session_dir, and the
+    registry that used to hold one is empty in a freshly launched window.
+
+    The outputs dir §7 also names is deliberately not walked. Nothing in a session
+    dir records where its transcript was written — session.json holds the capture
+    settings and the start stamp, not the output path — so a listing built from the
+    output directory could not say which session a file belonged to and would list
+    every markdown file the user keeps there, transcripts or not. The session dirs
+    are the whole of what makes a recovery reachable; the route that performs it
+    reports the output it wrote.
+    """
+    panel = settings.load()
+    root = _work_root(panel, _resolve(str(panel.get("out") or ""), _DEFAULT_OUT))
+    try:
+        # Reverse order on the stamp: live-<%Y%m%dT%H%M%S%fZ> sorts as time.
+        directories = sorted(root.glob(_SESSION_GLOB), reverse=True)
+    except OSError:  # an unreadable work directory is no runs, not a 500
+        return []
+    found = []
+    for directory in directories[:_PAST_LIMIT]:
+        if not (directory / _SESSION_MARKER).is_file():
+            continue
+        found.append({
+            # The directory's own name: unique per session, stable across
+            # restarts, and unlike a run id it means the same thing tomorrow.
+            "run_id": directory.name,
+            # Terminal as far as this window is concerned — this process did not
+            # start it and cannot watch it. Whether the page offers Recover is
+            # decided by `recoverable`, which is a different question.
+            "status": "done",
+            "out": None,
+            "session_dir": str(directory),
+            # The same rule session.py applies: a sealed chunk on disk is what
+            # makes a recovery worth offering, because run_from_chunks refuses an
+            # empty manifest and a Recover button that always fails is worse.
+            "recoverable": any((directory / "live-chunks").glob("*.wav")),
+        })
+    return found
+
+
+def _catalogue(state: AppState) -> list[dict]:
+    """Every run this window can talk about, this process's own runs first.
+
+    The registry wins over the work tree, so a live run is not shadowed by the saved
+    session it is writing into: the registry knows the real status, the output path
+    and whether the chunks are worth replaying, and the work tree knows only that a
+    directory exists.
+    """
+    runs = [{"run_id": r.run_id, "status": r.status,
+             "out": str(r.out_path) if r.out_path else None,
+             "session_dir": str(r.session_dir) if r.session_dir else None,
+             "recoverable": r.recoverable}
+            for r in state.runs.values()]
+    known = {str(r.session_dir) for r in state.runs.values() if r.session_dir}
+    return runs + [entry for entry in _past_sessions()
+                   if entry["session_dir"] not in known]
+
+
 # --- building a run --------------------------------------------------------
 
 
@@ -149,6 +253,18 @@ def _mode(body: Mapping) -> str:
     return mode
 
 
+def _resolve(raw: str, fallback: Path) -> Path:
+    """A panel path resolved against the repo rather than the process CWD.
+
+    Split out of _output_path so a route that only reads a stored name can resolve
+    it without the mkdir: creating a directory is a side effect a GET must not
+    have.
+    """
+    text = raw.strip()
+    path = Path(text).expanduser() if text else fallback
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
 def _output_path(body: Mapping, *, fallback: Path = _DEFAULT_OUT) -> Path:
     """The transcript's path, with its directory created.
 
@@ -157,11 +273,21 @@ def _output_path(body: Mapping, *, fallback: Path = _DEFAULT_OUT) -> Path:
     directory is created here so an unwritable path is a bad request instead of a
     run that fails after paying for transcription.
     """
-    raw = str(body.get("out") or "").strip()
-    path = Path(raw).expanduser() if raw else fallback
-    path = path if path.is_absolute() else REPO_ROOT / path
+    path = _resolve(str(body.get("out") or ""), fallback)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _work_root(panel: Mapping, out: Path) -> Path:
+    """Where a run's live sessions, chunks and cache live.
+
+    The panel's --work-dir, else the CLI's ".omnilingual beside the output" — the
+    same fallback run_live applies when LiveOptions.work_root is empty. Spelled
+    once here because three callers need it: the recording branch of _build, and
+    /api/runs looking for sessions a previous window left behind.
+    """
+    stored = str(panel.get("work_dir") or "").strip()
+    return Path(stored).expanduser() if stored else out.parent / ".omnilingual"
 
 
 def _recording_source(body: Mapping) -> Path:
@@ -197,11 +323,9 @@ def _build(body: Mapping) -> dict:
     # do not overwrite one another, and work_root is the panel's --work-dir with
     # the CLI's ".omnilingual beside the output" fallback.
     out = _output_path(body, fallback=source.with_suffix(".md"))
-    stored = str(body.get("work_dir") or "")
     return {"mode": mode,
             "kwargs": {**providers, "source": source, "out": out,
-                       "work_root": Path(stored).expanduser() if stored
-                       else out.parent / ".omnilingual",
+                       "work_root": _work_root(body, out),
                        "english_only": bool(body.get("english_only"))}}
 
 
@@ -406,7 +530,7 @@ def _setup_preview() -> str:
 
 def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
     token = token or mint_token()
-    state = AppState(token=token, port=port or 0)
+    state = AppState(token=token, port=port)
     # docs_url/redoc_url/openapi_url off: they would describe every route to a
     # caller that has not proved it may read them.
     app = FastAPI(title="omnilingual-ui", docs_url=None, redoc_url=None,
@@ -418,14 +542,32 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
 
         Including the port: 127.0.0.1 with no port is not the URL this server is
         reachable at, and a request that names it is not coming from the window.
+        A port=None app is the launcher that has not been told the port yet —
+        uvicorn only reports it after it binds — so it accepts any loopback port
+        rather than demanding the port-0 spelling, which would refuse every
+        request it is ever sent. The loopback hostname and the per-launch token
+        are still the two defences that matter; the port is not what stops
+        another process on the machine, and a rebound name still has to guess the
+        token.
         """
-        return host in (f"127.0.0.1:{state.port}", f"localhost:{state.port}")
+        authority = _authority(host)
+        if authority is None or authority[0] not in _LOOPBACK:
+            return False
+        return state.port is None or authority[1] == str(state.port)
 
     def origin_ok(origin: str | None) -> bool:
         # Absent is allowed: not every client sends Origin. Present and foreign is
         # refused, which is what stops a page on the open web from writing keys.
-        return origin is None or origin in (f"http://127.0.0.1:{state.port}",
-                                            f"http://localhost:{state.port}")
+        # A loopback origin on a *different* port is refused with the rest: it is a
+        # different origin, some other local process could be serving it, and the
+        # browser would happily let this window's token travel to it.
+        if origin is None:
+            return True
+        _, _, after_scheme = origin.rpartition("://")
+        authority = _authority(after_scheme or origin)
+        if authority is None or authority[0] not in _LOOPBACK:
+            return False
+        return state.port is None or authority[1] == str(state.port)
 
     def denied(reason: str) -> JSONResponse:
         return JSONResponse({"error": reason}, status_code=403)
@@ -541,6 +683,16 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
             # Not a validation rejection: a precondition and the filesystem both
             # fail here, and both are the user's to fix, so both are a 400.
             return JSONResponse({"error": str(exc)}, status_code=400)
+        except ImportError as exc:
+            # §13's "a missing extra is a button, not a traceback". Today all four
+            # local providers check importlib.util.find_spec and turn the absence
+            # into a ConfigError carrying their own install line, which the clause
+            # above already answers with a 400. This clause is what makes that a
+            # contract rather than a coincidence: a provider that let the ImportError
+            # out — or a future one that imports its engine directly — would
+            # otherwise be a 500, and a 500 is the one answer the page cannot render
+            # as a button. ModuleNotFoundError is a subclass, so it is covered here.
+            return JSONResponse({"error": str(exc)}, status_code=400)
         return {"run_id": runner.run_id, "mode": built["mode"]}
 
     @app.post("/api/session/stop")
@@ -556,12 +708,7 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
 
     @app.get("/api/runs")
     async def get_runs(request: Request) -> dict:
-        return {"runs": [
-            {"run_id": r.run_id, "status": r.status,
-             "out": str(r.out_path) if r.out_path else None,
-             "session_dir": str(r.session_dir) if r.session_dir else None,
-             "recoverable": r.recoverable}
-            for r in state.runs.values()]}
+        return {"runs": _catalogue(state)}
 
     def _recover(session_dir: Path, out: Path):
         """Start a replay of a saved session's chunks.
@@ -594,8 +741,10 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
                 raise ConfigError(f"{session_dir} is not a session dir")
             out = _output_path(body, fallback=_RECOVERED_OUT)
             runner = _recover(session_dir, out)
-        except (ConfigError, OSError) as exc:
-            # OSError is the output directory; ConfigError is everything else.
+        except (ConfigError, OSError, ImportError) as exc:
+            # OSError is the output directory; ConfigError is everything else; and a
+            # missing extra has to be a refusal here too, for the reason post_start
+            # gives.
             return JSONResponse({"error": str(exc)}, status_code=400)
         return {"run_id": runner.run_id, "mode": "recover"}
 
@@ -650,12 +799,19 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
                     if live is not None:
                         live.stop()
                 elif kind == "recover":
-                    past = state.runs.get(str(message.get("run_id") or ""))
-                    if (past is not None and past.session_dir is not None
-                            and past.recoverable and state.busy() is None):
+                    wanted = str(message.get("run_id") or "")
+                    # The catalogue, not the registry: a run listed by /api/runs
+                    # because its session dir is on disk has no runner to read,
+                    # and a page that offers a Recover button for it has to reach
+                    # the same run_from_chunks the route would.
+                    entry = next((e for e in _catalogue(state)
+                                  if e["run_id"] == wanted), None)
+                    if (entry is not None and entry["recoverable"]
+                            and entry["session_dir"] and state.busy() is None):
                         try:
-                            _recover(past.session_dir, REPO_ROOT / _RECOVERED_OUT)
-                        except (ConfigError, OSError) as exc:
+                            _recover(Path(entry["session_dir"]),
+                                     REPO_ROOT / _RECOVERED_OUT)
+                        except (ConfigError, OSError, ImportError) as exc:
                             state.queue.put_nowait(
                                 {"type": "log", "level": "error",
                                  "message": f"recovery refused: {exc}"})
