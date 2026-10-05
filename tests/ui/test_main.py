@@ -7,19 +7,31 @@ over a real socket, because the two properties that matter — the port is serve
 and the launch token never lands in anything the launcher prints — are properties
 of the running process, not of any object a mock can be asked about.
 
-The token tests are written so they cannot pass vacuously. One of them is the
-control: it builds a server the way uvicorn builds one by default, drives the
-same request at it, and requires the token to BE in the captured output. The
-launcher's own test then requires the token to be absent from the same request's
-output. So "absent" means "the launcher configured it away", and a launcher that
-left uvicorn's default in place fails rather than quietly satisfying the
-assertion.
+The token is checked twice, on the two paths it can take. One test drives
+`serve()` in-process; the other drives `-m omnilingual.ui` as a real process,
+because the in-process test never runs `main()`, and `main()` is where a future
+`--verbose` flag would sit — raising uvicorn's error logger after startup and
+putting the handshake record back into the output without touching either switch
+in `serve`. Both are also written so they cannot pass vacuously: one is the
+control, which builds a server the way uvicorn builds one by default and requires
+the token to BE in the captured output.
+
+"Readiness" is identity, not liveness. `_serving` requires the app on the port to
+hand back the launch token the launcher minted, so a second launcher or any other
+server answering `200 {"ok": true}` is refused instead of adopted; the squatter
+here answers exactly that, to every path, which is what the loser of a port race
+sees. And the constraint tests here assert on closed sets — the launcher's whole
+import list, and the real import graph in a child process — because a blacklist or
+a substring of the source is satisfied by the alias that bypasses it.
 """
 
 from __future__ import annotations
 
+import ast
 import base64
+import contextlib
 import http.client
+import http.server
 import json
 import logging
 import os
@@ -36,12 +48,14 @@ pytest.importorskip("fastapi", reason="the ui extra is not installed")
 pytest.importorskip("uvicorn", reason="the ui extra is not installed")
 
 from omnilingual.ui.__main__ import (  # noqa: E402
+    _serving,
     build_parser,
     free_port,
     main,
     open_window,
     serve,
 )
+from omnilingual.ui.server import mint_token  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO / "omnilingual" / "ui" / "__main__.py"
@@ -50,6 +64,11 @@ LAUNCHER = REPO / "omnilingual" / "ui" / "__main__.py"
 # it also covers a cold first import of the app on a loaded machine; the tests
 # that expect a failure pass a short one instead.
 READY_TIMEOUT = 20.0
+
+# Dropped from every child process this module starts. Nothing on the launcher's
+# path reads them, but the repo's own environment carries live ones and a captured
+# stream is the last place they should be able to reach.
+_API_KEY_VARS = frozenset({"SARVAM_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"})
 
 
 # --- driving a real socket ---------------------------------------------------
@@ -79,13 +98,92 @@ def _wait_until_serving(port: int, *, timeout: float = READY_TIMEOUT) -> bool:
     while time.monotonic() < deadline:
         try:
             status, body = _get(port, "/api/health", timeout=0.5)
-        except (OSError, http.client.HTTPException):
+        except (OSError, http.client.HTTPException, ValueError):
             time.sleep(0.05)
             continue
-        if status == 200 and json.loads(body).get("ok") is True:
+        payload = json.loads(body)
+        # isinstance, not duck typing: the body on this port is whatever else is
+        # on it, and a JSON array or string is a valid response that has no .get.
+        if status == 200 and isinstance(payload, dict) and payload.get("ok") is True:
             return True
         time.sleep(0.05)
     return False
+
+
+class _AnswersEverything(http.server.BaseHTTPRequestHandler):
+    """Answers 200 {"ok": true} to every path, the way the app answers health."""
+
+    def do_GET(self):  # noqa: N802 - the name http.server requires
+        body = b'{"ok": true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        """Silent: this listener's chatter would only pollute captured output."""
+
+
+class _Squatter:
+    """A loopback port held by something that answers instead of staying silent.
+
+    The bind-failure listener below is silent — it accepts and never writes — so
+    any probe at all refuses it. This one answers `200 {"ok": true}` to *every*
+    path, /api/health and /token.js included, which is exactly what the loser of
+    a port race sees when a second copy of the app got there first. A readiness
+    check that asks only "did something answer 200 with ok in it?" adopts it.
+    """
+
+    def __init__(self):
+        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                                      _AnswersEverything)
+        self.port = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    def __enter__(self) -> "_Squatter":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=10)
+
+
+@contextlib.contextmanager
+def _launcher_process(port: int, tmp_path):
+    """The real launcher as `-m omnilingual.ui`, running, with its output drained.
+
+    stdout is drained on a reader thread and stderr merged into it, so a test can
+    wait for a line instead of racing the pipe, and can assert against everything
+    the process wrote. The env file is pointed at a temp path so nothing here can
+    read the repo's real .env, and the API key variables are dropped from the
+    child's environment.
+
+    Yields (proc, lines); `lines` is complete only after the block exits.
+    """
+    env = {name: value for name, value in os.environ.items()
+           if name not in _API_KEY_VARS}
+    env["OMNILINGUAL_ENV_FILE"] = str(tmp_path / ".env")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "omnilingual.ui", "--no-window", "--port", str(port)],
+        cwd=str(REPO), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    lines: list[str] = []
+    reader = threading.Thread(target=lambda: lines.extend(proc.stdout), daemon=True)
+    reader.start()
+    try:
+        yield proc, lines
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            proc.kill()
+            proc.wait(timeout=15)
+        reader.join(timeout=15)
+        proc.stdout.close()
 
 
 def _launch_token(port: int) -> str:
@@ -176,17 +274,69 @@ def test_the_default_bind_is_loopback_only():
     assert parsed.port == 0
 
 
+# Every module the launcher may import, at any level of the file. A launcher is
+# the one file here that owns a window and a user-facing failure path, which makes
+# it the tempting place for a shortcut. So the set is closed: an import that is not
+# on this list is a decision to make in review, not something to remember to
+# forbid afterwards.
+_ALLOWED_LAUNCHER_IMPORTS = frozenset({
+    "__future__",  # annotations
+    "argparse",  # the CLI
+    "http.client",  # the readiness probe
+    "socket",  # free_port
+    "sys",
+    "threading",  # the serving thread
+    "time",
+    "uvicorn",  # the server
+    "webbrowser",  # the window fallback
+    "webview",  # the window
+    "omnilingual.ui.server",  # the app, imported lazily by serve()
+})
+
+
+def _imported_modules(source: str) -> set[str]:
+    """Every module an import statement in *source* names, whatever its alias.
+
+    Walked instead of grepped, so `from omnilingual import pipeline` and
+    `import subprocess as sp` come back as the same find as the plain spellings.
+    A substring test over the source cannot see either of those.
+    """
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            found.add(node.module or "")
+    return found
+
+
 def test_the_launcher_never_switches_the_system_output_device():
     """Nothing here may touch the machine's audio output.
 
     Switching the default output device is the one thing this project must never
-    do — it breaks every other app on the machine the moment a run starts. A
-    launcher is the tempting place for it (open the UI, "make sure sound plays"),
-    so the prohibition is pinned on the launcher's own source.
+    do — it breaks every other app on the machine the moment a run starts — and a
+    launcher is the tempting place for it ("open the UI, make sure sound plays").
+
+    Enforced as a *closed import set* over every import statement in the file:
+    `subprocess`, `os.system`, `ctypes` and the CoreAudio framework all require an
+    import, and none of those imports is allowed. That is strictly stronger than
+    the blacklist this replaces, which duplicated an entry, omitted
+    `AudioObjectSetPropertyData` — the API that actually sets the default output
+    device — and named two things (`os.system`, `Popen`) that were unreachable
+    without an `os` or `subprocess` import to reach them by.
+
+    The API names are asserted as well, so a file that reached one without an
+    import on the list fails with a message naming the API, not a set difference.
     """
     source = LAUNCHER.read_text(encoding="utf-8")
-    for forbidden in ("SwitchAudioSource", "kAudioHardwarePropertyDefaultOutputDevice",
-                      "SwitchAudioSource", "os.system", "Popen"):
+    imported = _imported_modules(source)
+    assert imported <= _ALLOWED_LAUNCHER_IMPORTS, (
+        f"the launcher may not import {sorted(imported - _ALLOWED_LAUNCHER_IMPORTS)}; "
+        "everything that can reach a shell or the CoreAudio API needs an import, "
+        "and this set is closed"
+    )
+    for forbidden in ("AudioObjectSetPropertyData", "SwitchAudioSource",
+                      "kAudioHardwarePropertyDefaultOutputDevice"):
         assert forbidden not in source, (
             f"{forbidden} in the launcher: the launcher must never change the "
             "system's audio output device"
@@ -194,11 +344,34 @@ def test_the_launcher_never_switches_the_system_output_device():
 
 
 def test_the_launcher_does_not_import_the_pipeline():
-    # The web layer reaches a run only through omnilingual.ui.session; importing
-    # the pipeline here would pull a heavy package into the process that owns the
-    # window. Mirrors the server.py rule in tests/test_ui_packaging.py.
-    source = LAUNCHER.read_text(encoding="utf-8")
-    assert "omnilingual.pipeline" not in source
+    """Checked on the import graph, not on the text of the file.
+
+    `"omnilingual.pipeline" not in source` is satisfied by
+    `from omnilingual import pipeline`, which pulls in the same package without
+    containing the literal it forbids — so the launcher is imported in a child
+    process and `sys.modules` is asked what actually got loaded.
+
+    uvicorn and webview are imported there too, because the launcher imports them
+    inside functions and those are import sites like any other. `omnilingual.ui.
+    server` is deliberately not on the list: importing the app is what serving
+    *is*, and the app reaches the pipeline by design — what is forbidden is the
+    launcher reaching it, on the window-owning process's own.
+    """
+    probe = (
+        "import importlib, sys\n"
+        "importlib.import_module('omnilingual.ui.__main__')\n"
+        "for name in ('uvicorn', 'webview'):\n"
+        "    try: importlib.import_module(name)\n"
+        "    except ImportError: pass\n"
+        "sys.exit('omnilingual.pipeline' in sys.modules)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], cwd=str(REPO),
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, (
+        "importing the launcher pulled in omnilingual.pipeline, so the process that "
+        "owns the window loads the pipeline; the probe said "
+        f"{result.stderr[-400:]!r}"
+    )
 
 
 # --- serving on a real loopback port -----------------------------------------
@@ -209,12 +382,13 @@ def running():
     """A launched server, on a real port, always shut down afterwards.
 
     Yields a callable so each test can pick its own port and get back the
-    (server, thread, port) triple.
+    (server, thread, port) triple. Extra keywords go to `serve`, for the tests
+    that need the app built with a launch token they know the value of.
     """
     started: list[tuple] = []
 
-    def _start(port: int):
-        server, thread = serve(port)
+    def _start(port: int, **kwargs):
+        server, thread = serve(port, **kwargs)
         started.append((server, thread))
         return server, thread, port
 
@@ -273,6 +447,47 @@ def test_the_launched_server_only_accepts_requests_naming_its_own_port(running):
 
     status, _ = _get(port, "/api/health", host=f"127.0.0.1:{port}")
     assert status == 200
+
+
+def test_readiness_is_this_launchs_own_app_and_not_just_a_200_with_ok(running):
+    """`200 {"ok": true}` is not proof of anything; the launch token is.
+
+    One live server, built with a token this test knows, asked twice: with its own
+    token the readiness check passes, with a different one it fails. The second
+    half is what gives the first half teeth — a check that returned True for
+    anything answering on the port would satisfy the first assertion alone.
+    """
+    token = mint_token()
+    server, thread, port = running(free_port(), token=token)
+    assert _wait_until_serving(port), "the launched server never came up"
+
+    assert _serving("127.0.0.1", port, token=token, thread=thread,
+                    timeout=READY_TIMEOUT) is True, (
+        "the app built with our token must be recognised as ours")
+    assert _serving("127.0.0.1", port, token=mint_token(), thread=thread,
+                    timeout=1.0) is False, (
+        "an app that hands back a different token is somebody else's server, "
+        "however healthy it answers")
+
+
+def test_a_dead_serving_thread_fails_the_readiness_check_at_once():
+    """The bind happens inside the serving thread, so its death is already the answer.
+
+    Waiting out the whole startup timeout instead turns a port collision into
+    twenty seconds of silence before saying anything, when the cause was decided
+    within a fifth of a second.
+    """
+    thread = threading.Thread(target=lambda: None)
+    thread.start()
+    thread.join()
+
+    started = time.monotonic()
+    assert _serving("127.0.0.1", free_port(), token="irrelevant", thread=thread,
+                    timeout=READY_TIMEOUT) is False
+    assert time.monotonic() - started < 1.0, (
+        "a serving thread that has died must end the readiness wait, not be "
+        "waited out for the full startup timeout"
+    )
 
 
 # --- the token must not reach anything the launcher writes -------------------
@@ -374,8 +589,11 @@ def test_the_launch_token_never_reaches_the_launchers_output(uvicorn_logging, ca
 
     written = captured.out + captured.err
     assert token not in written, (
-        "the launch token reached the launcher's output — remove access_log=False "
-        "or lower log_level and this is what happens"
+        "the launch token reached the launcher's output. Both switches in serve() "
+        "are load-bearing and the repair is to keep them, not to loosen them: "
+        "access_log=False is what stops the http protocol writing request lines at "
+        "all, and log_level='warning' is what keeps the websocket handshake record "
+        "off uvicorn.error. Do not add a verbosity flag that lowers either."
     )
 
 
@@ -393,12 +611,34 @@ def no_window_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "webview", None)
 
 
-def test_open_window_does_nothing_when_the_window_is_refused(monkeypatch):
+def test_no_window_opens_neither_a_window_nor_the_browser(monkeypatch):
+    """`--no-window` means one thing: nothing is opened.
+
+    The contrast is what gives this teeth. The same recorder is called both ways,
+    and the second call has to land in it — so an `open_window` that never opened
+    anything, which the empty-only version of this test could not tell from a
+    correct one, fails here.
+    """
     opened: list[str] = []
+
+    class Recorder:
+        def create_window(self, title, url, **kwargs):
+            opened.append(url)
+
+        def start(self, **kwargs):
+            pass
+
+    monkeypatch.setitem(sys.modules, "webview", Recorder())
     monkeypatch.setattr("webbrowser.open", opened.append)
-    monkeypatch.setitem(sys.modules, "webview", object())
+
     open_window("http://127.0.0.1:9999/", no_window=True)
-    assert opened == [], "--no-window must not open anything at all"
+    assert opened == [], "--no-window must not open a window or the browser"
+
+    open_window("http://127.0.0.1:9999/")
+    assert opened == ["http://127.0.0.1:9999/"], (
+        "without --no-window the window is opened, so the assertion above is "
+        "about the flag and not about a launcher that opens nothing at all"
+    )
 
 
 def test_open_window_falls_back_to_the_browser_without_pywebview(no_window_module,
@@ -460,6 +700,32 @@ def test_main_reports_a_bind_failure_instead_of_waiting_forever(capfd):
         f"the error must name the port it could not bind, got {captured.err!r}")
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_main_refuses_a_port_held_by_a_server_that_answers(capfd):
+    """A stranger's `200 {"ok": true}` is not our server, and the launcher says so.
+
+    The end-to-end half of the identity check, and the case the silent listener
+    above cannot reach: a real HTTP server holds the port and answers every path
+    exactly as the app does. A readiness check that only asks "did something
+    answer 200 with ok in it?" passes, prints this stranger's URL as its own,
+    exits 0, and in the windowed path opens a second window onto the stranger's
+    app — where the app's own one-run-at-a-time guard then answers 409.
+    """
+    with _Squatter() as squatter:
+        code = main(["--no-window", "--port", str(squatter.port)],
+                    startup_timeout=5.0)
+        port = squatter.port
+    captured = capfd.readouterr()
+
+    assert code == 1, (
+        "a port held by somebody else's server must be refused, not reported as "
+        f"ours; the launcher exited {code} having said {captured.out!r}"
+    )
+    assert captured.out == "", "a refused launch must not print a URL"
+    assert f":{port}" in captured.err, (
+        f"the error must name the port it could not use, got {captured.err!r}")
+
+
 def test_the_launcher_serves_until_it_is_stopped(tmp_path):
     """`--no-window` serves and prints the URL; it does not print and exit.
 
@@ -469,41 +735,68 @@ def test_the_launcher_serves_until_it_is_stopped(tmp_path):
     can be waited for instead of raced — the server can answer /api/health in the
     microseconds before main() reaches its print, and a test that terminated on
     the health answer would be asserting on that race rather than on the launcher.
+
+    Liveness is then sampled for two whole seconds, not once. The divergence this
+    forbids is print-and-exit, and that happens within milliseconds of the URL
+    appearing: a single poll at one instant can still catch the process alive and
+    pass a launcher that printed and died.
     """
     port = free_port()
-    env = {**os.environ,
-           # A temp env file so nothing here can read the repo's real .env, which
-           # holds live API keys.
-           "OMNILINGUAL_ENV_FILE": str(tmp_path / ".env")}
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "omnilingual.ui", "--no-window", "--port", str(port)],
-        cwd=str(REPO), env=env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    lines: list[str] = []
-    reader = threading.Thread(target=lambda: lines.extend(proc.stdout), daemon=True)
-    reader.start()
     url = f"http://127.0.0.1:{port}/"
-    try:
+    with _launcher_process(port, tmp_path) as (proc, lines):
         served = _wait_until_serving(port, timeout=READY_TIMEOUT)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and not any(url in line for line in lines):
             time.sleep(0.05)
         announced = any(url in line for line in lines)
-        alive = proc.poll() is None
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
-            proc.kill()
-            proc.wait(timeout=15)
-        reader.join(timeout=15)
-        proc.stdout.close()
 
-    output = "".join(lines)
+        exited_with = None
+        until = time.monotonic() + 2.0
+        while time.monotonic() < until:
+            if proc.poll() is not None:
+                exited_with = proc.poll()
+                break
+            time.sleep(0.05)
+        output = "".join(lines)
+
     assert served, f"the launcher never served /api/health; output was {output!r}"
     assert announced, f"the launcher never printed its URL; output was {output!r}"
-    assert alive, "the launcher exited instead of keeping the server up"
+    assert exited_with is None, (
+        f"--no-window printed its URL and exited {exited_with}; it has to keep "
+        f"serving until it is stopped. Output was {output!r}"
+    )
+
+
+def test_the_launch_token_never_reaches_the_output_of_the_real_launcher(tmp_path):
+    """The same guarantee, on the path a user actually runs: `-m omnilingual.ui`.
+
+    The in-process test above calls `serve()` directly, so `main()` never runs —
+    and `main()` is where a future `--verbose` flag would sit, putting the
+    handshake record back by raising uvicorn's error logger after startup without
+    touching either switch in `serve`. So this drives the launcher as a real
+    process: it reads the minted token out of the running app, sends the real
+    WebSocket handshake with it in the request line, and requires the token to be
+    in neither stream the process wrote.
+    """
+    port = free_port()
+    with _launcher_process(port, tmp_path) as (_proc, lines):
+        assert _wait_until_serving(port, timeout=READY_TIMEOUT), (
+            f"the launcher never served; output was {''.join(lines)!r}")
+        token = _launch_token(port)
+        head = _token_in_request_line(port, token, upgrade=True)
+        _drain_logging()
+    output = "".join(lines)
+
+    assert head.startswith("HTTP/1.1 101"), (
+        "the real handshake should have been accepted, so the token really did "
+        f"reach uvicorn's websocket logger; got {head[:60]!r}"
+    )
+    assert token not in output, (
+        "the launch token reached the output of the real launcher process. Both "
+        "switches in serve() are load-bearing and the repair is to keep them: "
+        "access_log=False, and log_level='warning' — do not let anything in main() "
+        f"lower uvicorn.error's level afterwards. Output was {output!r}"
+    )
 
 
 def test_the_launcher_refuses_a_non_loopback_bind(capsys):
