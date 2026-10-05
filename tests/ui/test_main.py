@@ -21,8 +21,12 @@ hand back the launch token the launcher minted, so a second launcher or any othe
 server answering `200 {"ok": true}` is refused instead of adopted; the squatter
 here answers exactly that, to every path, which is what the loser of a port race
 sees. And the constraint tests here assert on closed sets — the launcher's whole
-import list, and the real import graph in a child process — because a blacklist or
-a substring of the source is satisfied by the alias that bypasses it.
+import list, the shapes that load a module without an import statement saying so,
+and the modules it really loads at runtime — because a blacklist or a substring of
+the source is satisfied by the alias that bypasses it. Between them the first two
+catch what the launcher *names* and the last catches what it *loads*; none of them
+catches an already-loaded module used through a computed attribute, and each test
+says so where it applies.
 """
 
 from __future__ import annotations
@@ -71,6 +75,23 @@ READY_TIMEOUT = 20.0
 _API_KEY_VARS = frozenset({"SARVAM_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"})
 
 
+def _child_env(tmp_path) -> dict[str, str]:
+    """The environment every child process here starts with.
+
+    One helper rather than a comprehension per call site, because the scrub is the
+    kind of thing that gets added at the first subprocess and forgotten at the
+    second: the launcher's own child was scrubbed last round while the import-graph
+    probe beside it still inherited all three live keys, and its assertion
+    interpolates `result.stderr`, so a traceback that dumped the environment would
+    have put them into captured pytest output. The env file is pointed at a temp
+    path in the same breath, so no child can read the repo's real .env either.
+    """
+    env = {name: value for name, value in os.environ.items()
+           if name not in _API_KEY_VARS}
+    env["OMNILINGUAL_ENV_FILE"] = str(tmp_path / ".env")
+    return env
+
+
 # --- driving a real socket ---------------------------------------------------
 
 
@@ -98,10 +119,15 @@ def _wait_until_serving(port: int, *, timeout: float = READY_TIMEOUT) -> bool:
     while time.monotonic() < deadline:
         try:
             status, body = _get(port, "/api/health", timeout=0.5)
+            # Inside the try on purpose: the body on this port is whatever else
+            # holds it, so "something answered" and "what it answered" are the same
+            # failure here, and a squatter's HTML error page is a poll that has not
+            # succeeded yet — which is what `except ValueError` below is for. Left
+            # outside, it was a JSONDecodeError out of a test helper.
+            payload = json.loads(body)
         except (OSError, http.client.HTTPException, ValueError):
             time.sleep(0.05)
             continue
-        payload = json.loads(body)
         # isinstance, not duck typing: the body on this port is whatever else is
         # on it, and a JSON array or string is a valid response that has no .get.
         if status == 200 and isinstance(payload, dict) and payload.get("ok") is True:
@@ -157,15 +183,12 @@ def _launcher_process(port: int, tmp_path):
 
     stdout is drained on a reader thread and stderr merged into it, so a test can
     wait for a line instead of racing the pipe, and can assert against everything
-    the process wrote. The env file is pointed at a temp path so nothing here can
-    read the repo's real .env, and the API key variables are dropped from the
-    child's environment.
+    the process wrote. The env is `_child_env`, so nothing here can read the
+    repo's real .env and no live API key travels with the child.
 
     Yields (proc, lines); `lines` is complete only after the block exits.
     """
-    env = {name: value for name, value in os.environ.items()
-           if name not in _API_KEY_VARS}
-    env["OMNILINGUAL_ENV_FILE"] = str(tmp_path / ".env")
+    env = _child_env(tmp_path)
     proc = subprocess.Popen(
         [sys.executable, "-m", "omnilingual.ui", "--no-window", "--port", str(port)],
         cwd=str(REPO), env=env, text=True,
@@ -310,6 +333,65 @@ def _imported_modules(source: str) -> set[str]:
     return found
 
 
+# The callables that load a module without any import statement naming it.
+# `__import__` is a builtin, so calling it needs nothing on the closed set, and
+# `importlib.import_module` needs `importlib`, which is not on it either.
+_DYNAMIC_IMPORT_CALLS = frozenset({"__import__", "import_module"})
+
+
+def _loads_a_module_undeclared(source: str) -> set[str]:
+    """Every shape in *source* that reaches a module no import statement names.
+
+    These are the holes in a closed set built from import statements, and all three
+    work from *inside a function body*, where the runtime probes never look until
+    the launcher is actually serving:
+
+    - `__import__("omnilingual.pipeline")` and `importlib.import_module(...)` are
+      imports that no `import` statement in the file records.
+    - `sys.modules["os"]` needs no import at all, because a launcher that is
+      already running has `os`, `subprocess` and `platform` in that dictionary —
+      uvicorn puts them there. So `sys.modules["os"].system(...)` runs a shell
+      command with the closed set entirely satisfied, which is the shape the
+      runtime audit below also cannot see, since it loads no new module.
+
+    Reported as text, so a failure names the spelling rather than a set difference.
+    """
+    shapes: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = (func.attr if isinstance(func, ast.Attribute)
+                    else getattr(func, "id", ""))
+            if name in _DYNAMIC_IMPORT_CALLS:
+                first = node.args[0] if node.args else None
+                target = (repr(first.value)
+                          if isinstance(first, ast.Constant) else "<computed>")
+                shapes.add(f"{name}({target})")
+        elif isinstance(node, ast.Subscript) and _is_module_dictionary(node.value):
+            shapes.add(f"{_dotted(node.value)}[...]")
+    return shapes
+
+
+def _is_module_dictionary(node: ast.expr) -> bool:
+    """Whether *node* is `sys.modules`, another module's `modules`, or a bare one.
+
+    Deliberately not tied to the name `sys`, so `import sys as s; s.modules[...]`
+    and `from sys import modules; modules[...]` are the same find.
+    """
+    if isinstance(node, ast.Attribute):
+        return node.attr == "modules"
+    return isinstance(node, ast.Name) and node.id == "modules"
+
+
+def _dotted(node: ast.expr) -> str:
+    """*node* as dotted source text, or `<computed>` if it is not built from names."""
+    if isinstance(node, ast.Attribute):
+        return f"{_dotted(node.value)}.{node.attr}"
+    if isinstance(node, ast.Name):
+        return node.id
+    return "<computed>"
+
+
 def test_the_launcher_never_switches_the_system_output_device():
     """Nothing here may touch the machine's audio output.
 
@@ -317,23 +399,49 @@ def test_the_launcher_never_switches_the_system_output_device():
     do — it breaks every other app on the machine the moment a run starts — and a
     launcher is the tempting place for it ("open the UI, make sure sound plays").
 
-    Enforced as a *closed import set* over every import statement in the file:
-    `subprocess`, `os.system`, `ctypes` and the CoreAudio framework all require an
-    import, and none of those imports is allowed. That is strictly stronger than
-    the blacklist this replaces, which duplicated an entry, omitted
-    `AudioObjectSetPropertyData` — the API that actually sets the default output
-    device — and named two things (`os.system`, `Popen`) that were unreachable
-    without an `os` or `subprocess` import to reach them by.
+    Three layers, because one closed set is not enough and the previous version of
+    this test claimed it was:
 
-    The API names are asserted as well, so a file that reached one without an
-    import on the list fails with a message naming the API, not a set difference.
+    1. A *closed import set* over every import statement in the file, at any depth.
+       `subprocess` and `ctypes` are not on it, and the CoreAudio framework is
+       reached through `ctypes`, so no spelling of `import ctypes` passes. This is
+       strictly stronger than the blacklist it replaces, which duplicated an entry,
+       omitted `AudioObjectSetPropertyData` — the API that actually sets the default
+       output device — and named two things (`os.system`, `Popen`) that were
+       unreachable without an `os` or `subprocess` import to reach them by. The API
+       names are asserted too, so a file that reached one fails naming the API.
+    2. No *undeclared load*: `__import__(...)`, `importlib.import_module(...)` and
+       `sys.modules[...]` are rejected wherever they appear, function bodies
+       included. The last one is the correction to the claim this test used to
+       make. "Everything that reaches a shell needs an import" was false — a running
+       launcher already has `os` and `subprocess` in `sys.modules` (uvicorn puts
+       them there), so `sys.modules["os"].system("...")` ran a shell command with
+       the closed set fully satisfied. It needs no import because there is nothing
+       left to import.
+    3. A *runtime audit* of what the launcher really loads, in
+       `test_the_launchers_own_runtime_imports_stay_inside_what_it_declares`.
+
+    What this does not prevent, deliberately: a launcher that computes its way to a
+    module rather than naming it — `eval`, `getattr(sys.modules, name)`, a name
+    assembled at runtime. Closing that needs an import hook or a frozen import
+    table, and the threat these tests defend against is a careless or well-meaning
+    future commit, not an adversary writing to the spec. The line is drawn at
+    "reachable by writing it the obvious way".
     """
     source = LAUNCHER.read_text(encoding="utf-8")
     imported = _imported_modules(source)
     assert imported <= _ALLOWED_LAUNCHER_IMPORTS, (
         f"the launcher may not import {sorted(imported - _ALLOWED_LAUNCHER_IMPORTS)}; "
-        "everything that can reach a shell or the CoreAudio API needs an import, "
-        "and this set is closed"
+        "a module that can reach a shell or the CoreAudio API is not on this list, "
+        "and the list is closed"
+    )
+    undeclared = _loads_a_module_undeclared(source)
+    assert not undeclared, (
+        f"the launcher loads modules without declaring them: {sorted(undeclared)}. "
+        "Every module the launcher uses is named by an import statement on a closed "
+        "list, so a load no statement records is a load no reviewer can see. "
+        "sys.modules[...] needs no import at all — a running launcher already has "
+        "os and subprocess in it, and the shell reaches CoreAudio from there"
     )
     for forbidden in ("AudioObjectSetPropertyData", "SwitchAudioSource",
                       "kAudioHardwarePropertyDefaultOutputDevice"):
@@ -343,7 +451,7 @@ def test_the_launcher_never_switches_the_system_output_device():
         )
 
 
-def test_the_launcher_does_not_import_the_pipeline():
+def test_the_launcher_does_not_import_the_pipeline(tmp_path):
     """Checked on the import graph, not on the text of the file.
 
     `"omnilingual.pipeline" not in source` is satisfied by
@@ -366,12 +474,114 @@ def test_the_launcher_does_not_import_the_pipeline():
         "sys.exit('omnilingual.pipeline' in sys.modules)\n"
     )
     result = subprocess.run([sys.executable, "-c", probe], cwd=str(REPO),
+                            env=_child_env(tmp_path),
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, (
         "importing the launcher pulled in omnilingual.pipeline, so the process that "
         "owns the window loads the pipeline; the probe said "
         f"{result.stderr[-400:]!r}"
     )
+
+
+# Runs the real launcher, on a real port, in a child process and reports every
+# module it loaded itself. `omnilingual.ui.server` is stood in for, because the
+# real app reaches the pipeline by design (`server` -> `session` -> `pipeline`) and
+# that would make every audit finding ambiguous. With the app stubbed, each module
+# in the delta was loaded by the launcher or by uvicorn on its behalf, which is the
+# attribution that turns "the pipeline is in sys.modules" into a finding about the
+# launcher.
+_RUNTIME_IMPORT_PROBE = """
+import http.client, importlib, json, sys, time, types
+
+stub = types.ModuleType("omnilingual.ui.server")
+async def app(scope, receive, send):
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-length", b"2")]})
+    await send({"type": "http.response.body", "body": b"ok"})
+stub.create_app = lambda **kwargs: app
+sys.modules["omnilingual.ui.server"] = stub
+
+before = set(sys.modules)
+launcher = importlib.import_module("omnilingual.ui.__main__")
+port = launcher.free_port()
+launcher.serve(port, token="audit")
+
+served = False
+deadline = time.monotonic() + 60
+while time.monotonic() < deadline:
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
+        try:
+            conn.request("GET", "/")
+            conn.getresponse().read()
+        finally:
+            conn.close()
+        served = True
+        break
+    except OSError:
+        time.sleep(0.05)
+time.sleep(0.5)
+print(json.dumps({"served": served, "gained": sorted(set(sys.modules) - before)}))
+"""
+
+
+def _within(name: str, package: str) -> bool:
+    """Whether *name* is *package* or something inside it."""
+    return name == package or name.startswith(f"{package}.")
+
+
+def test_the_launchers_own_runtime_imports_stay_inside_what_it_declares(tmp_path):
+    """What the launcher actually loads, as opposed to what it says it loads.
+
+    The closed import set is source-based, so it cannot see a load that happens
+    when `serve()` runs — a `__import__("omnilingual.pipeline")` inside that
+    function body passes every static check in this module, and the probe above
+    cannot see it either, because that probe never calls `serve()`. This one does.
+
+    The app is stubbed precisely so the delta is attributable: `ctypes` is the only
+    route to CoreAudio that this process has no legitimate use for, and it is not
+    loaded by anything on the launcher's path, so finding it in the delta means the
+    launcher opened that door. `omnilingual.pipeline` means the window-owning
+    process loaded the pipeline, which is the constraint this asserts.
+
+    What it cannot see is stated rather than implied: `os`, `subprocess` and
+    `platform` really are in this delta, because uvicorn imports them and the
+    launcher has to have uvicorn. So "did a module with shell reach get loaded" is
+    not a runtime question here at all — the shell is loaded whatever the launcher
+    does. What is runtime-checkable is whether the launcher *reached into* the ones
+    it did not declare, and that is the static `sys.modules[...]` ban's job, next
+    door. Between them: the static set and shape ban cover code, this covers the
+    modules that code turned out to load.
+
+    `uvicorn` being in the delta is the non-vacuity check. Without it an audit that
+    failed to observe anything at all would pass.
+    """
+    result = subprocess.run([sys.executable, "-c", _RUNTIME_IMPORT_PROBE],
+                            cwd=str(REPO), env=_child_env(tmp_path),
+                            capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, (
+        f"the runtime import audit itself failed: {result.stderr[-600:]!r}")
+    audit = json.loads(result.stdout)
+    assert audit["served"], (
+        "the launcher never served in the audit process, so nothing it loads while "
+        f"serving was measured; it said {result.stdout[-400:]!r}")
+
+    gained = audit["gained"]
+    assert "uvicorn" in gained, (
+        "the audit saw no uvicorn in the delta, so it cannot be trusted to see "
+        f"anything else either; it reported {gained[:20]!r}")
+
+    ctypes_in = [name for name in gained if _within(name, "ctypes")]
+    assert not ctypes_in, (
+        f"the launcher loaded {ctypes_in} at runtime. ctypes is the only route to "
+        "the CoreAudio API from here and nothing on the launcher's path needs it, "
+        "so this process can reach the default-output-device API and must not")
+
+    pipeline_in = [name for name in gained if _within(name, "omnilingual.pipeline")]
+    assert not pipeline_in, (
+        f"the launcher loaded {pipeline_in} at runtime. The launcher must never "
+        "import omnilingual.pipeline: it owns the window, and the pipeline is the "
+        "app's to run")
 
 
 # --- serving on a real loopback port -----------------------------------------
