@@ -35,7 +35,8 @@ import platform
 import secrets as pysecrets
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping
+import threading
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -273,6 +274,19 @@ def _readiness(*, mic: bool) -> dict:
     return body
 
 
+def _restart_lines() -> Iterator[str]:
+    """coreaudiod's restart, as the two lines a page needs to show for it.
+
+    osascript's authorisation dialog is modal and nothing else in the app runs
+    behind it, so the page is told a dialog is waiting and then told the restart
+    finished. A generator rather than a bare call so the work runs inside the
+    worker's own frame and its refusal arrives as a log line.
+    """
+    yield "waiting for the macOS authorisation dialog"
+    audio.restart_daemon()
+    yield "the audio daemon has restarted"
+
+
 async def _json_object(request: Request) -> dict:
     """The body as a JSON object, or a 400 that repeats none of it.
 
@@ -289,6 +303,64 @@ async def _json_object(request: Request) -> dict:
     return body
 
 
+# --- long operations on a worker thread -------------------------------------
+
+
+def _post(state: AppState, loop: asyncio.AbstractEventLoop, message: dict) -> None:
+    """Hand one event to the loop that drains the queue. Callable from any thread.
+
+    The same handoff SessionRunner._emit makes: the queue is consumed by a
+    coroutine on that loop, so a worker thread that pushed onto it directly would
+    race the reader. A loop that has closed takes the message straight instead of
+    dropping it — the queue outlives any single loop, and a page that reconnects
+    re-reads from it.
+    """
+    if loop.is_closed():
+        state.queue.put_nowait(message)
+    else:
+        loop.call_soon_threadsafe(state.queue.put_nowait, message)
+
+
+def _log(state: AppState, loop: asyncio.AbstractEventLoop, level: str,
+         message: str) -> None:
+    _post(state, loop, {"type": "log", "level": level, "message": message})
+
+
+def _background(target: Callable[[], None]) -> threading.Thread:
+    """Run `target` on a daemon thread and return immediately.
+
+    §7 puts setup's and apply's progress on the WebSocket log channel, and this
+    server has exactly one event loop. A handler that waited on the work would
+    queue those lines somewhere nothing could read until it returned, so the
+    streaming would be a queue write with nothing behind it, and no other request
+    would be answered meanwhile: audio.setup sleeps up to 60s waiting for
+    BlackHole, restart_daemon waits on a GUI authorisation dialog for up to 120s,
+    and setup-mac.sh installs packages. Detaching is what keeps the page live.
+
+    Daemon, like every other thread here: quitting during an install must not wait
+    for brew.
+    """
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread
+
+
+def _stream(state: AppState, loop: asyncio.AbstractEventLoop,
+            lines: Iterator[str]) -> None:
+    """Relay a worker's output line by line, then report how it ended.
+
+    Relayed rather than collected because the caller has already been told the work
+    started; the page learns the outcome here, which is why a failure is an error
+    log rather than the 500 a synchronous route would have answered. A failure is
+    caught here because nobody is left to catch it once the worker is detached.
+    """
+    try:
+        for line in lines:
+            _log(state, loop, "info", line)
+    except Exception as exc:  # noqa: BLE001 - the page has to be told
+        _log(state, loop, "error", f"{type(exc).__name__}: {exc}")
+
+
 # --- the setup script ------------------------------------------------------
 
 
@@ -301,35 +373,30 @@ def _setup_argv(*flags: str) -> list[str]:
     return [str(SETUP_SCRIPT), *flags, "--yes"]
 
 
-def _setup_apply(state: AppState) -> str:
-    """Run setup-mac.sh for real, relaying each line as it appears.
+def _setup_lines() -> Iterator[str]:
+    """setup-mac.sh's own output, on both streams, as it is written.
 
-    Line by line rather than one communicate() at the end, because the install runs
-    for minutes and a page that shows nothing until it finishes cannot be trusted
-    to still be open when it does. stderr is merged into stdout because the script
-    writes everything human-facing there and keeps stdout for captured values.
+    stderr is merged into stdout because the script writes everything
+    human-facing there and keeps stdout for captured values, and it is iterated
+    lazily because the install runs for minutes.
     """
-    lines: list[str] = []
     process = subprocess.Popen(_setup_argv(), stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True,
                                errors="replace")
     try:
         for raw in process.stdout:
-            line = raw.rstrip("\n")
-            lines.append(line)
-            state.queue.put_nowait({"type": "log", "level": "info",
-                                    "message": line})
+            yield raw.rstrip("\n")
         code = process.wait(timeout=_SETUP_TIMEOUT)
     finally:
         process.stdout.close()
     if code != 0:
         raise RuntimeError(f"setup-mac.sh exited {code}")
-    return "\n".join(lines)
 
 
 def _setup_preview() -> str:
     """The script's dry-run text. Both streams joined, as above, but read in one
-    go: the preview must not write anything, so it needs no log channel."""
+    go: the preview must not write anything, so it needs no log channel, and a
+    dry run finishes in seconds."""
     done = subprocess.run(_setup_argv("--dry-run"), capture_output=True, text=True,
                           timeout=_SETUP_TIMEOUT, errors="replace")
     if done.returncode != 0:
@@ -443,21 +510,15 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
 
     @app.post("/api/audio/setup")
     async def post_audio_setup(request: Request):
-        try:
-            for line in audio.setup():
-                state.queue.put_nowait({"type": "log", "level": "info",
-                                        "message": line})
-        except Exception as exc:  # noqa: BLE001 - reported to the page
-            return JSONResponse({"error": str(exc)}, status_code=500)
-        return _readiness(mic=False)
+        loop = asyncio.get_running_loop()
+        _background(lambda: _stream(state, loop, audio.setup()))
+        return {"started": True}
 
     @app.post("/api/audio/restart-daemon")
     async def post_restart_daemon(request: Request):
-        try:
-            audio.restart_daemon()
-        except (OSError, subprocess.SubprocessError) as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
-        return _readiness(mic=False)
+        loop = asyncio.get_running_loop()
+        _background(lambda: _stream(state, loop, _restart_lines()))
+        return {"started": True}
 
     @app.post("/api/session/start")
     async def post_start(request: Request):
@@ -547,10 +608,9 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
 
     @app.post("/api/setup/apply")
     async def post_setup_apply(request: Request):
-        try:
-            return {"output": _setup_apply(state)}
-        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+        loop = asyncio.get_running_loop()
+        _background(lambda: _stream(state, loop, _setup_lines()))
+        return {"started": True}
 
     @app.websocket("/ws")
     async def ws(socket: WebSocket) -> None:

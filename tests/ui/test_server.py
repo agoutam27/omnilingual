@@ -16,6 +16,8 @@ import asyncio
 import io
 import pathlib
 import subprocess
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -85,6 +87,31 @@ def _start_body(**over):
 
 def _state(client):
     return client.app.state.ui
+
+
+def _logs(client):
+    return [m["message"] for m in list(_state(client).queue._queue)
+            if m["type"] == "log"]
+
+
+def _wait_for_logs(client, count, timeout=10.0):
+    """The log messages a detached operation has produced, waiting for `count`.
+
+    Long operations run on a worker thread now, so their output arrives after the
+    response does. Polling is what keeps the assertions deterministic without
+    putting a join handle in the production module purely for the tests.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and len(_logs(client)) < count:
+        time.sleep(0.01)
+    return _logs(client)
+
+
+def _wait_until(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not predicate():
+        time.sleep(0.01)
+    return predicate()
 
 
 def _readiness(**over):
@@ -521,6 +548,7 @@ def test_audio_endpoint_does_not_switch_the_output_device(api, monkeypatch):
 
 def test_audio_setup_streams_progress_and_reports_the_mic_as_not_checked(api,
                                                                         monkeypatch):
+    """Progress goes on the log channel; readiness is the page's own re-poll."""
     from omnilingual.ui import audio
 
     probes = []
@@ -532,15 +560,16 @@ def test_audio_setup_streams_progress_and_reports_the_mic_as_not_checked(api,
     monkeypatch.setattr(audio, "probe", probe)
     monkeypatch.setattr(audio, "setup", lambda *a, **k: iter(["building", "ready"]))
     client, token = api
-    body = client.post("/api/audio/setup", headers=_ok(token)).json()
-    assert probes == [False]
-    assert body["mic_checked"] is False
-    queued = list(_state(client).queue._queue)
-    assert [m["message"] for m in queued if m["type"] == "log"] == [
-        "building", "ready"]
+    res = client.post("/api/audio/setup", headers=_ok(token))
+    assert res.status_code == 200
+    assert _wait_for_logs(client, 2) == ["building", "ready"]
+    # The route must not report a microphone nobody asked about; the page re-polls
+    # /api/audio, which probes for real and says so with mic_checked.
+    assert client.get("/api/audio", headers=_ok(token)).json()["mic_checked"] is True
 
 
 def test_audio_setup_failure_is_reported(api, monkeypatch):
+    """A detached operation cannot answer 500, so its failure is a log line."""
     from omnilingual.ui import audio
 
     def broken(*a, **k):
@@ -548,11 +577,13 @@ def test_audio_setup_failure_is_reported(api, monkeypatch):
         yield  # pragma: no cover - a generator, never reached
 
     monkeypatch.setattr(audio, "setup", broken)
-    monkeypatch.setattr(audio, "probe", lambda *a, **k: _readiness())
     client, token = api
     res = client.post("/api/audio/setup", headers=_ok(token))
-    assert res.status_code == 500
-    assert "BlackHole" in res.json()["error"]
+    assert res.status_code == 200
+    # Named like SessionRunner._fail's, so the page can tell a refusal from a crash.
+    assert _wait_for_logs(client, 1) == ["RuntimeError: BlackHole never appeared"]
+    errors = [m for m in list(_state(client).queue._queue) if m["type"] == "log"]
+    assert [m["level"] for m in errors] == ["error"]
 
 
 def test_audio_restart_daemon_reports_a_refusal(api, monkeypatch):
@@ -562,11 +593,106 @@ def test_audio_restart_daemon_reports_a_refusal(api, monkeypatch):
         raise subprocess.CalledProcessError(1, "osascript")
 
     monkeypatch.setattr(audio, "restart_daemon", refused)
-    monkeypatch.setattr(audio, "probe", lambda *a, **k: _readiness())
     client, token = api
     res = client.post("/api/audio/restart-daemon", headers=_ok(token))
-    assert res.status_code == 500
-    assert "error" in res.json()
+    assert res.status_code == 200
+    assert _wait_for_logs(client, 1)
+
+
+# --- long operations must not hold the event loop ----------------------------
+#
+# §7 sends setup's and apply's progress on the WebSocket log channel, and this
+# server has exactly one event loop. A handler that blocks on the work queues its
+# own progress lines somewhere nothing can read until it returns, so the streaming
+# is only a queue write, and no other request is served meanwhile. audio.setup
+# waits up to 60s for BlackHole and restart-daemon waits on a GUI auth dialog for
+# up to 120s, so this is minutes of an unresponsive app.
+
+
+class _SlowProc:
+    """A Popen stand-in that emits one line and then blocks, like a real install."""
+
+    def __init__(self, release):
+        self._release = release
+        self._emitted = False
+        self.stdout = self
+        self.code = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._emitted:
+            self._emitted = True
+            return "==> installing\n"
+        self._release.wait(8)
+        raise StopIteration
+
+    def close(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.code
+
+
+def _block(route, monkeypatch, release):
+    """Make the operation behind `route` block on `release` after it starts."""
+    from omnilingual.ui import audio
+
+    if route == "/api/audio/setup":
+        def setup(*a, **k):
+            yield "building"
+            release.wait(8)
+        monkeypatch.setattr(audio, "setup", setup)
+    elif route == "/api/audio/restart-daemon":
+        def restart():
+            release.wait(8)
+        monkeypatch.setattr(audio, "restart_daemon", restart)
+    else:
+        monkeypatch.setattr(server.subprocess, "Popen",
+                            lambda argv, **kw: _SlowProc(release))
+
+
+@pytest.mark.parametrize("route", ["/api/audio/setup", "/api/audio/restart-daemon",
+                                   "/api/setup/apply"])
+def test_a_long_operation_never_holds_the_event_loop(api, monkeypatch, route):
+    release = threading.Event()
+    _block(route, monkeypatch, release)
+    client, token = api
+    started = time.monotonic()
+    res = client.post(route, headers=_ok(token))
+    elapsed = time.monotonic() - started
+    try:
+        # Still serving while the operation is in flight: this request would queue
+        # behind it if the handler had not returned yet.
+        assert client.get("/api/health", headers={"Host": HOST}).status_code == 200
+    finally:
+        release.set()
+    assert res.status_code == 200
+    assert elapsed < 2, (
+        f"{route} blocked its own event loop for {elapsed:.1f}s, so the progress "
+        "it queues cannot reach a page until it finishes")
+
+
+def test_a_long_operation_runs_on_a_daemon_thread(api, monkeypatch):
+    """A quit during an install must not wait for brew."""
+    from omnilingual.ui import audio
+
+    seen = {}
+
+    def setup(*a, **k):
+        thread = threading.current_thread()
+        seen["thread"] = thread
+        yield "done"
+
+    monkeypatch.setattr(audio, "setup", setup)
+    client, token = api
+    client.post("/api/audio/setup", headers=_ok(token))
+    assert _wait_for_logs(client, 1) == ["done"]
+    thread = seen.get("thread")
+    assert thread is not None
+    assert thread.daemon is True
+    assert thread is not threading.main_thread()
 
 
 # --- starting a run --------------------------------------------------------
@@ -1189,12 +1315,9 @@ def test_setup_apply_streams_on_the_log_channel(api, monkeypatch):
     client, token = api
     res = client.post("/api/setup/apply", headers=_ok(token))
     assert res.status_code == 200
-    assert "installing" in res.json()["output"]
     assert "--dry-run" not in seen["argv"]
     assert "--yes" in seen["argv"]
-    queued = [m["message"] for m in list(_state(client).queue._queue)
-              if m["type"] == "log"]
-    assert queued == ["==> installing", "==> done"]
+    assert _wait_for_logs(client, 2) == ["==> installing", "==> done"]
 
 
 def test_setup_apply_reports_a_failure(api, monkeypatch):
@@ -1202,8 +1325,12 @@ def test_setup_apply_reports_a_failure(api, monkeypatch):
                         lambda argv, **kw: _FakeProc(["==> failed\n"], code=1))
     client, token = api
     res = client.post("/api/setup/apply", headers=_ok(token))
-    assert res.status_code == 500
-    assert res.json()["error"]
+    assert res.status_code == 200
+    assert _wait_for_logs(client, 2) == [
+        "==> failed", "RuntimeError: setup-mac.sh exited 1"]
+    levels = [m["level"] for m in list(_state(client).queue._queue)
+              if m["type"] == "log"]
+    assert levels == ["info", "error"]
 
 
 def test_setup_routes_take_no_path_from_the_request(api, monkeypatch):
@@ -1218,6 +1345,7 @@ def test_setup_routes_take_no_path_from_the_request(api, monkeypatch):
     client, token = api
     client.post("/api/setup/apply", headers=_ok(token),
                 json={"repo": "; touch /tmp/pwned"})
+    assert _wait_until(lambda: "argv" in seen)
     assert seen["argv"] == [str(SCRIPT), "--yes"]
 
 
