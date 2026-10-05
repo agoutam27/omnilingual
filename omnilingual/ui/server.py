@@ -82,6 +82,22 @@ _RECOVERED_OUT = Path("recovered.md")
 # without one. Everything else under /api/ is token-guarded.
 _UNGUARDED = frozenset({"/api/health", "/token.js", "/"})
 
+# The page's own source, matched by prefix rather than by name. A browser cannot
+# attach a header to <link href> or <script src>, so a token-guarded asset is a
+# page that cannot load itself: the 403 arrives with no way for the page to read
+# the token that would let it retry, and the window comes up blank.
+#
+# A prefix and not a list of filenames, because a list means every asset added
+# later silently needs this line edited, with a blank window as the only symptom.
+# The trailing slash is what keeps /static and /staticfoo on the guarded side.
+#
+# This costs no protection: /token.js is already unguarded and hands the token to
+# anything that can reach the port, so the token is not a secret from another
+# local process, and the page's source holds no key, no transcript and no user
+# data. Host and Origin are still checked above this check — it is the token
+# check alone, and /api/ and the WebSocket stay guarded.
+_UNGUARDED_PREFIX = "/static/"
+
 # The two names a loopback request may arrive under. localhost is another spelling
 # of 127.0.0.1, not another machine.
 _LOOPBACK = ("127.0.0.1", "localhost")
@@ -179,6 +195,15 @@ def _authority(url: str) -> tuple[str, str] | None:
     if not sep or not host or not (port.isascii() and port.isdigit()):
         return None
     return host, port
+
+
+def _unauthenticated(path: str) -> bool:
+    """Whether a path answers without the per-launch token.
+
+    Exact names plus one prefix, decided in one place, so the exemption is a
+    single rule rather than a fragment repeated at each use.
+    """
+    return path in _UNGUARDED or path.startswith(_UNGUARDED_PREFIX)
 
 
 def _past_sessions() -> list[dict]:
@@ -596,7 +621,7 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
         origin = request.headers.get("origin")
         if not origin_ok(origin, host):
             return denied("bad origin")
-        if request.url.path not in _UNGUARDED and \
+        if not _unauthenticated(request.url.path) and \
                 request.headers.get(TOKEN_HEADER) != state.token:
             return denied("bad token")
         return await call_next(request)

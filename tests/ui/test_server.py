@@ -451,6 +451,56 @@ def test_a_foreign_host_cannot_read_the_page_or_the_token_script(api):
         assert token not in res.text
 
 
+def test_the_page_loads_its_own_assets_without_a_token(api):
+    """The browser cannot attach a header to <link href> or <script src>.
+
+    So an asset behind the token is a window that comes up blank, with a 403 the
+    page has no way to read and therefore no way to retry past. These two files
+    are the whole of what the tags in index.html load, and neither may carry the
+    token — the exemption is a narrowing of who may read them, not of what they
+    contain.
+    """
+    client, token = api
+    for name in ("style.css", "app.js"):
+        res = client.get(f"/static/{name}", headers={"Host": HOST})
+        assert res.status_code == 200, (name, res.status_code, res.text[:120])
+        assert token not in res.text, f"{name} leaks the token"
+    # The exemption is the assets, not the token: /api/ is still guarded.
+    assert client.get("/api/audio", headers={"Host": HOST}).status_code == 403
+
+
+def test_the_static_exemption_does_not_relax_host_or_origin(api):
+    """The exemption is the token check alone; the two guards run before it."""
+    client, _ = api
+    bad_host = client.get("/static/app.js", headers={"Host": "evil.example"})
+    assert bad_host.status_code == 403, bad_host.text
+    foreign = client.get("/static/app.js", headers={
+        "Host": HOST, "Origin": "http://evil.example"})
+    assert foreign.status_code == 403, foreign.text
+    # A wrong token on an asset changes nothing, because none is asked for.
+    wrong = client.get("/static/app.js", headers={
+        "Host": HOST, "X-Omnilingual-Token": "not-the-token"})
+    assert wrong.status_code == 200
+
+
+def test_the_unauthenticated_rule_is_exact_names_plus_one_prefix(api):
+    """Names would have to be re-edited per asset; a prefix is what holds.
+
+    Also pins the trailing slash: "/static" and "/staticfoo" stay on the guarded
+    side, so the rule cannot be widened by accident.
+    """
+    from omnilingual.ui.server import _unauthenticated
+
+    for path in ("/", "/api/health", "/token.js",
+                 "/static/style.css", "/static/app.js",
+                 "/static/nested/thing.js"):
+        assert _unauthenticated(path), path
+    for path in ("/api/keys", "/api/audio", "/api/session/start",
+                 "/api/settings", "/api/healthz", "/static", "/staticfoo/app.js",
+                 "/token.js.map"):
+        assert not _unauthenticated(path), path
+
+
 def test_mint_token_is_unguessable_and_fresh():
     first, second = mint_token(), mint_token()
     assert first != second

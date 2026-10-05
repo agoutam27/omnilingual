@@ -214,6 +214,17 @@ function toggleMode() {
   $("source").disabled = live;
 }
 
+function numberField(id) {
+  // A cleared box is sent as null, never as Number("") — and Number("") is 0, a
+  // real number rather than "not provided". The cost cap is the worst of it: 0
+  // means 0 >= 0, so the run halts its API calls on the very first segment and
+  // reports itself halted with no stated cause. session._numeric documents blank
+  // as absent, so null hands the field back to the backend's own default instead
+  // of this page inventing one.
+  const raw = $(id).value.trim();
+  return raw === "" ? null : Number(raw);
+}
+
 function collect() {
   const live = currentMode() === "live";
   const body = {
@@ -225,39 +236,50 @@ function collect() {
     mt: $("mt").value,
     mt_model: $("mt_model").value || null,
     diarize: $("diarize").checked,
-    num_speakers: $("diarize").checked ? Number($("num_speakers").value) : null,
+    num_speakers: $("diarize").checked ? numberField("num_speakers") : null,
     langs: $("langs").value.split(",").map((s) => s.trim()).filter(Boolean),
     english_only: $("english_only").checked,
     work_dir: $("work_dir").value,
     // Chunk bounds are validated and used for a recording run too, so they
     // travel in both modes rather than only in the live one.
-    max_chunk_s: Number($("max_chunk_s").value),
-    min_chunk_s: Number($("min_chunk_s").value),
+    max_chunk_s: numberField("max_chunk_s"),
+    min_chunk_s: numberField("min_chunk_s"),
   };
   if (live) {
     Object.assign(body, {
       device: $("device").value,
       mic_only: $("mic_only").checked,
-      target_s: Number($("target_s").value),
-      noise_db: Number($("noise_db").value),
-      stt_workers: Number($("stt_workers").value),
-      max_cost: Number($("max_cost").value),
+      target_s: numberField("target_s"),
+      noise_db: numberField("noise_db"),
+      stt_workers: numberField("stt_workers"),
+      max_cost: numberField("max_cost"),
     });
   }
   return body;
 }
 
-async function loadToken() {
-  // Fetched rather than inlined, so no token sits in the HTML. /token.js is a
-  // script rather than JSON, so fetching it does not run it: its text has to be
-  // executed. The bootstrap in index.html has already done this in order to
-  // load this file, so the fetch is a fallback rather than the normal path.
-  if (!window.OMNILINGUAL_TOKEN) {
+function loadToken() {
+  // /token.js is a script, so it is loaded as one. Fetching it would return its
+  // text without running it, and the token would stay undefined — every request
+  // would then go out without the header and the window would answer itself 403,
+  // which looks like a dead server rather than a dead page. Nothing is inlined
+  // here and no token is hard-coded; the token is a property of this launch.
+  return new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    script.textContent = await (await fetch("/token.js")).text();
+    script.src = "/token.js";
+    script.onload = () => {
+      if (!window.OMNILINGUAL_TOKEN) {
+        reject(new Error("/token.js loaded but set no token"));
+        return;
+      }
+      token = window.OMNILINGUAL_TOKEN;
+      resolve();
+    };
+    // A 403 or a missing file arrives as an error event on the element, not as
+    // a thrown exception, so it is caught here or the window sits half-loaded.
+    script.onerror = () => reject(new Error("could not load /token.js"));
     document.head.appendChild(script);
-  }
-  token = window.OMNILINGUAL_TOKEN;
+  });
 }
 
 // --- audio readiness -------------------------------------------------------

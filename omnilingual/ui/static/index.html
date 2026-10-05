@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>omnilingual</title>
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
@@ -93,36 +94,6 @@
   </section>
 </main>
 
-<script>
-// The static mount is token-guarded like every other path, so a plain
-// <script src> or <link href> arrives with no X-Omnilingual-Token and is
-// answered with a 403. /token.js is the one unguarded file the page may read,
-// so the token comes from there and the two assets are fetched with it. Nothing
-// is inlined here and nothing is fetched off-origin.
-(async () => {
-  const TOKEN_HEADER = "X-Omnilingual-Token";
-  // /token.js is a script, not JSON: fetching it does not run it, so its text is
-  // executed before the token it sets can be read.
-  const tokenScript = document.createElement("script");
-  tokenScript.textContent = await (await fetch("/token.js")).text();
-  document.head.appendChild(tokenScript);
-
-  const token = window.OMNILINGUAL_TOKEN;
-  const guarded = (path) =>
-    fetch(path, { headers: { [TOKEN_HEADER]: token } });
-
-  const style = document.createElement("style");
-  style.textContent = await (await guarded("/static/style.css")).text();
-  document.head.appendChild(style);
-
-  const code = document.createElement("script");
-  code.textContent = await (await guarded("/static/app.js")).text();
-  document.body.appendChild(code);
-})().catch((err) => {
-  const banner = document.getElementById("banner");
-  banner.textContent = `the page's own files could not be loaded: ${err.message}`;
-  banner.className = "banner error";
-});
-</script>
+<script src="/static/app.js"></script>
 </body>
 </html>

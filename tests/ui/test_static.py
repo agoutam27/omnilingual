@@ -48,7 +48,12 @@ def test_all_three_assets_exist():
 
 
 def test_the_page_serves_the_real_assets_not_the_placeholder():
-    """`/` must be the file on disk, and both assets must be reachable.
+    """`/` must be the file on disk, and the browser must be able to load it.
+
+    The requests below carry no token, because that is the only shape a browser
+    can produce for <link href> and <script src>. Asserting 200 here is what
+    proves the page can load its own CSS and JS at all; a version that needed the
+    header was a page that came up blank, and this test was what hid it.
 
     The static mount is created when the directory exists, so a renamed or
     missing asset shows up here as the placeholder page or a 404 rather than as
@@ -66,15 +71,29 @@ def test_the_page_serves_the_real_assets_not_the_placeholder():
         assert page.status_code == 200
         assert page.text == _read("index.html"), "the placeholder page is served"
 
-        # /static is token-guarded like every other path, so the page's own
-        # files arrive with the header and are refused without it.
+        # No token header: exactly what the page's own tags send.
         for name in ("style.css", "app.js"):
-            served = client.get(f"/static/{name}",
-                                headers={"X-Omnilingual-Token": token})
-            assert served.status_code == 200, name
+            served = client.get(f"/static/{name}")
+            assert served.status_code == 200, (
+                f"the browser cannot load /static/{name} ({served.status_code})")
             assert served.text == _read(name), f"{name} is not the file on disk"
-            refused = client.get(f"/static/{name}")
-            assert refused.status_code == 403, f"/static/{name} is unguarded"
+            # The other way round: still a token that guards /api, so the
+            # exemption is not the whole token check being dropped.
+            assert client.get("/api/audio").status_code == 403
+            assert token not in served.text
+
+
+def test_the_pages_tags_are_plain_links_to_its_own_assets():
+    """The page must load the way the brief specifies, not through a bootstrap.
+
+    An inline loader would be a second, untested copy of the asset's loading
+    path, and a `<link>`/`<script>` pair is the only shape that needs no token
+    header at all.
+    """
+    html = _read("index.html")
+    assert '<link rel="stylesheet" href="/static/style.css">' in html
+    assert '<script src="/static/app.js"></script>' in html
+    assert "fetch(" not in html, "index.html loads its assets with fetch again"
 
 
 # --- the page talks to the API the way the server is built -----------------
@@ -82,37 +101,34 @@ def test_the_page_serves_the_real_assets_not_the_placeholder():
 
 def test_page_fetches_the_token_and_sends_it_on_every_call():
     js = _read("app.js")
-    assert "/token.js" in js, "the token must be fetched, not hard-coded"
+    assert "/token.js" in js, "the token must be loaded, not hard-coded"
     assert "X-Omnilingual-Token" in js
-    # The header is sent with the fetched token, not merely named: every call
-    # goes through one helper, and the bootstrap that loads the two guarded
-    # assets sends it too.
-    for body in (js, _read("index.html")):
-        assert re.search(r"\[TOKEN_HEADER\]\s*:\s*token\b", body), (
-            "a request goes out without the token in the header")
-    assert js.count("await fetch(") == 2, "requests must go through api()"
-    html = _read("index.html")
-    assert re.search(r"fetch\(\"/token\.js\"\)", html), (
-        "the bootstrap that loads the assets never fetches the token")
+    # The header is sent with the loaded token, not merely named.
+    assert re.search(r"\[TOKEN_HEADER\]\s*:\s*token\b", js), (
+        "a request goes out without the token in the header")
     # A literal in the page would outlive the launch it was minted for.
-    assert not re.search(r"token\s*=\s*[\"']", html), (
-        "a token literal is baked into the page")
+    for name in ("index.html", "app.js"):
+        assert not re.search(r"token\s*=\s*[\"']", _read(name)), (
+            "a token literal is baked into the page")
 
 
-def test_the_token_script_is_executed_not_merely_fetched():
+def test_the_token_is_loaded_by_running_the_script_not_by_reading_its_text():
     """/token.js is JavaScript, and fetch() returns its text without running it.
 
     A page that only awaits the fetch reads an undefined token and then answers
     every request with a 403, which looks like a dead server rather than a dead
-    page. Both the bootstrap and app.js must put the response text into a script
-    element, which is what executes it.
+    page. It has to be a <script src>, and the token has to be checked for once
+    it has run rather than assumed.
     """
-    for name in ("index.html", "app.js"):
-        body = _read(name)
-        assert 'createElement("script")' in body, f"{name} builds no script element"
-        assert re.search(
-            r'\w+\.textContent\s*=\s*await\s*\(\s*await fetch\("/token\.js"\)\)\.text\(\)',
-            body), f"{name} fetches the token script without executing it"
+    js = _read("app.js")
+    assert 'createElement("script")' in js, "no script element is built"
+    assert re.search(r'\bsrc\s*=\s*"/token\.js"', js), (
+        "the token script is not loaded by URL, so nothing runs it")
+    assert re.search(r"!\s*window\.OMNILINGUAL_TOKEN", js), (
+        "the token is used without checking that it arrived")
+    # A load failure is an event on the element, not a thrown exception.
+    assert "script.onerror" in js or "onerror" in js, (
+        "a refused /token.js leaves the window half-loaded and silent")
 
 
 def test_every_panel_field_is_loaded_from_the_stored_defaults():
@@ -246,17 +262,53 @@ def test_no_live_cost_meter_is_built_from_the_always_zero_field():
     assert re.search(r"cost cap", js, re.I), "the cap must be labelled as a cap"
 
 
+def test_a_cleared_numeric_field_is_sent_as_null_not_zero():
+    """Number("") is 0, and 0 is a real budget for the cost cap.
+
+    A cleared cost cap sent as 0 halts the API calls on the first segment and
+    reports `halted` with no stated cause; a cleared noise floor changes VAD for
+    every chunk; a cleared worker count silently drops to one worker.
+    session._numeric documents blank as "not provided", so null is the only
+    reading that gets the field's own default back.
+    """
+    js = _read("app.js")
+    helper = _function(js, "numberField")
+    assert re.search(r'===\s*""\s*\?\s*null\b', helper), (
+        "a cleared numeric field is sent as 0 rather than as 'not provided'")
+    assert "Number(" in helper, "a field that is filled must still be a number"
+    collect = _function(js, "collect")
+    for key in ("num_speakers", "target_s", "max_chunk_s", "min_chunk_s",
+                "noise_db", "stt_workers", "max_cost"):
+        assert f'numberField("{key}")' in collect, f"{key} bypasses the helper"
+        assert f'Number($("{key}")' not in collect, (
+            f"{key} turns a cleared box into 0")
+
+
 def test_page_shows_key_presence_not_key_values():
     js = _read("app.js")
     assert "/api/keys" in js
     # Copy assertion: the backend answers booleans, and these two words are the
     # whole of what the page is allowed to say about a stored key.
     assert "configured" in js and "not configured" in js
-    # The typed value exists only in the password field and the PUT body.
-    assert re.search(r"\[name\]: value", js) or re.search(r"\[name\]: field\.value", js)
-    assert re.search(r"field\.value\s*=\s*\"\"", js), (
-        "the typed value stays in the DOM after a successful write")
+    assert re.search(r"\[name\]: value", js), "the write sends no value"
     assert re.search(r"type = \"password\"", js)
+
+
+def test_a_typed_key_value_reaches_no_node_but_the_one_that_sent_it():
+    """The value exists in the password field and in the PUT body, nowhere else.
+
+    Containment rather than a count: every mention of the field's value has to
+    be one of the two allowed ones, so a badge that grows the typed value — the
+    way a value leaks into a screenshot — fails here.
+    """
+    js = _read("app.js")
+    every = re.findall(r"field\.value", js)
+    assert every, "the Save button no longer reads the field"
+    allowed = (re.findall(r"writeKey\(name, field\.value", js)
+               + re.findall(r"field\.value\s*=\s*\"\"", js))
+    assert len(allowed) == len(every), (
+        f"field.value is used {len(every)} times but only {len(allowed)} of them "
+        "send it or clear it")
 
 
 def test_a_refused_key_write_is_reported_and_never_retried():
@@ -280,21 +332,42 @@ def test_page_offers_recovery_only_when_the_run_is_recoverable():
 
 
 def test_page_never_switches_the_system_output_itself():
-    # Routing output silently breaks volume keys; only the server may report it.
+    # Routing output silently breaks volume keys, so nothing in the page may name
+    # the setter or reach for its flag. The flag is banned as a string literal
+    # rather than as a bare substring, so a comment mentioning it is not a
+    # failure while an actual call still is.
     for name in ("index.html", "style.css", "app.js"):
         body = _read(name)
         assert "SwitchAudioSource" not in body, name
-        assert "-s " not in body, name
+        assert not re.search(r"""["'`]-s["'`]""", body), (
+            f"{name} passes SwitchAudioSource -s")
 
 
 def test_a_wrong_output_device_is_its_own_warning():
-    """The backend appends it to detail and keeps it out of `ok`."""
+    """The backend appends it to detail and keeps it out of `ok`.
+
+    So a ready capture with a wrong output must be a *warning*: painting it as a
+    failure would tell the user their audio is broken when the capture works and
+    only the speaker route is wrong.
+    """
     js = _read("app.js")
     apply = _function(js, "applyAudio")
     assert re.search(r"detail\.length", apply), "detail is never inspected"
-    # ok drives the severity, so a warning the backend considers non-fatal is
-    # not painted like a failure.
-    assert "ready.ok" in apply
+    assert re.search(r'ready\.ok\s*\?\s*"warn"\s*:\s*"error"', apply), (
+        "the banner level is not taken from the readiness verdict")
+
+
+def test_the_end_panel_never_substitutes_an_output_path():
+    """`end.out` is null when nothing was written, and null is the whole answer.
+
+    A default name here would tell the user a file exists that does not, which is
+    the one thing an end panel exists to settle.
+    """
+    js = _read("app.js")
+    end = _function(js, "renderEnd")
+    assert "message.out" in end
+    assert not re.search(r"message\.out\s*\|\|", end), (
+        "the end panel substitutes a path the server did not send")
 
 
 def test_the_microphone_is_never_reported_as_authorised_when_it_was_not_probed():
