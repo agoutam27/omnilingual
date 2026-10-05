@@ -2008,11 +2008,23 @@ def test_server_does_not_import_the_pipeline():
 
 
 def test_server_imports_no_web_dependency_outside_itself():
+    """Each web library has one legal home: fastapi in server.py, uvicorn and
+    pywebview in the launcher, and nowhere else.
+
+    The allowance is per dependency, so a module that may import uvicorn still
+    may not import fastapi, and no third module may claim either. It was written
+    when the package held server.py alone; tests/test_ui_packaging.py states the
+    same rule including __main__.py, which is where the launcher is supposed to
+    import uvicorn from, and the two must not disagree.
+    """
+    allowed = {"server.py": {"fastapi"},
+               "__main__.py": {"uvicorn", "pywebview"}}
     here = pathlib.Path(server.__file__).parent
     for path in sorted(here.glob("*.py")):
-        if path.name == "server.py":
-            continue
+        permitted = allowed.get(path.name, set())
         source = path.read_text(encoding="utf-8")
         for lib in ("fastapi", "uvicorn", "pywebview"):
-            assert f"import {lib}" not in source, path.name
-            assert f"from {lib}" not in source, path.name
+            if lib in permitted:
+                continue
+            assert f"import {lib}" not in source, f"{path.name} imports {lib}"
+            assert f"from {lib}" not in source, f"{path.name} imports {lib}"
