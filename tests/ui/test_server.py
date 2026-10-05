@@ -368,6 +368,41 @@ def test_an_app_with_no_port_still_demands_its_token(env):
                       ).status_code == 403
 
 
+def test_an_app_with_no_port_refuses_a_cross_port_loopback_origin(env):
+    """The bug this pins: an app that was never told its port compared no port at
+    all, so any loopback origin was accepted — a page on 127.0.0.1:62345 got 200
+    and the token would have travelled with it.
+
+    Without a port of its own the app still knows where the request arrived: the
+    Host header. Same-origin means Origin names that authority, so a different port
+    is refused. Host stays permissive because that is finding 6's fix and it cannot
+    be narrowed until a launcher reports the bound port."""
+    token = mint_token()
+    client = TestClient(create_app(token=token, port=None))
+    for origin in ("http://127.0.0.1:62345", "http://localhost:62345",
+                   "http://evil.example:5599"):
+        res = client.get("/api/defaults",
+                         headers={"X-Omnilingual-Token": token, "Host": HOST,
+                                  "Origin": origin})
+        assert res.status_code == 403, origin
+        assert res.json()["error"] == "bad origin", origin
+
+
+def test_an_app_with_no_port_accepts_an_origin_that_matches_the_host(env):
+    """The other half of the fix: same-origin still answers. The window fetches
+    http://127.0.0.1:5599, so Origin and Host agree on the port and it is served —
+    "port unknown" must not degrade into "refuse everything"."""
+    token = mint_token()
+    client = TestClient(create_app(token=token, port=None))
+    for host, origin in ((HOST, "http://127.0.0.1:5599"),
+                         ("localhost:5599", "http://localhost:5599"),
+                         ("127.0.0.1:62345", "http://127.0.0.1:62345")):
+        res = client.get("/api/keys",
+                         headers={"X-Omnilingual-Token": token, "Host": host,
+                                  "Origin": origin})
+        assert res.status_code == 200, (host, origin)
+
+
 @pytest.mark.parametrize(("method", "path"), RESERVED)
 def test_every_reserved_route_rejects_a_request_without_the_token(api, method, path):
     client, _ = api
@@ -1681,6 +1716,29 @@ def test_websocket_rejects_a_cross_port_loopback_origin(api):
         with client.websocket_connect("/ws",
                                       headers=_ok(token, Origin="http://127.0.0.1:62345")):
             pass
+
+
+def test_websocket_rejects_a_cross_port_loopback_origin_when_the_port_is_unknown(env):
+    """The handshake repeats the origin check itself, so it repeats the fix: with no
+    port of its own this app used to open the socket with any loopback origin, and
+    the handshake is the one request a cross-site page can make with no preflight."""
+    token = mint_token()
+    client = TestClient(create_app(token=token, port=None))
+    with pytest.raises(Exception):
+        with client.websocket_connect(
+                "/ws", headers={"X-Omnilingual-Token": token, "Host": HOST,
+                                "Origin": "http://127.0.0.1:62345"}):
+            pass
+
+
+def test_websocket_with_no_port_opens_for_its_own_origin(env):
+    """The matching half: a same-origin handshake is still accepted."""
+    token = mint_token()
+    client = TestClient(create_app(token=token, port=None))
+    with client.websocket_connect(
+            "/ws", headers={"X-Omnilingual-Token": token, "Host": HOST,
+                            "Origin": f"http://127.0.0.1:{PORT}"}) as socket:
+        assert socket.receive_json()["type"] == "state"
 
 
 def test_websocket_accepts_the_token_as_a_query_parameter(api):

@@ -133,8 +133,9 @@ class AppState:
 
     token: str
     # The port this server is reachable at, or None when the launcher has not said.
-    # None does not mean "port 0": it means the port half of the Host and Origin
-    # checks is not yet known, so any loopback port is legal.
+    # None does not mean "port 0": it means this app cannot compare a port against a
+    # fixed number, so Host may name any loopback port and Origin is matched against
+    # the Host the request arrived on instead.
     port: int | None
     runs: dict[str, SessionRunner] = field(default_factory=dict)
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -555,7 +556,7 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
             return False
         return state.port is None or authority[1] == str(state.port)
 
-    def origin_ok(origin: str | None) -> bool:
+    def origin_ok(origin: str | None, host: str) -> bool:
         # Absent is allowed: not every client sends Origin. Present and foreign is
         # refused, which is what stops a page on the open web from writing keys.
         # A loopback origin on a *different* port is refused with the rest: it is a
@@ -567,7 +568,15 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
         authority = _authority(after_scheme or origin)
         if authority is None or authority[0] not in _LOOPBACK:
             return False
-        return state.port is None or authority[1] == str(state.port)
+        if state.port is not None:
+            return authority[1] == str(state.port)
+        # A port=None app has no port of its own to compare against, but it does not
+        # need one: the Host header says which authority the request actually
+        # arrived on, and a same-origin request names that authority in Origin too.
+        # So same-origin is decided by comparing the two, and "port unknown" never
+        # means "any loopback port is my origin" — which is the hole a page on
+        # another local port would walk straight through.
+        return _authority(host) == authority
 
     def denied(reason: str) -> JSONResponse:
         return JSONResponse({"error": reason}, status_code=403)
@@ -585,7 +594,7 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
         if not host_ok(host):
             return denied("bad host")
         origin = request.headers.get("origin")
-        if not origin_ok(origin):
+        if not origin_ok(origin, host):
             return denied("bad origin")
         if request.url.path not in _UNGUARDED and \
                 request.headers.get(TOKEN_HEADER) != state.token:
@@ -771,7 +780,8 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
         supplied = (socket.headers.get(TOKEN_HEADER)
                     or socket.query_params.get("token"))
         if not host_ok(socket.headers.get("host", "")) \
-                or not origin_ok(socket.headers.get("origin")) \
+                or not origin_ok(socket.headers.get("origin"),
+                                 socket.headers.get("host", "")) \
                 or supplied != state.token:
             await socket.close(code=1008)
             return
