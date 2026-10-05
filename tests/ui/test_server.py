@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import io
 import pathlib
+import re
 import subprocess
 import threading
 import time
@@ -564,6 +565,43 @@ def test_settings_reject_a_malformed_body(api):
                      content=b"{not json")
     assert res.status_code == 400
     assert "JSON" in res.json()["error"]
+
+
+def test_settings_reject_a_non_finite_number(api):
+    """1e400 parses as inf, which the route's own serializer refuses — so the
+    answer is 400, not a 500.
+
+    Posted as raw bytes on purpose: httpx's json encoder refuses to serialize inf,
+    so json= would test the client rather than the server. The literal is what a
+    browser sends, since JSON.parse accepts 1e400 happily.
+    """
+    client, token = api
+    res = client.put("/api/settings", headers=_ok(token),
+                     content=b'{"max_cost": 1e400}')
+    assert res.status_code == 400
+    assert "max_cost" in res.json()["error"]
+
+
+def test_a_rejected_setting_does_not_touch_the_store(api):
+    """The blocker: save() used to write the file and *then* let the response
+    serializer fail, so a 500 left `max_cost = inf` on disk. load() reads inf back
+    happily, which made every later save fail too — only deleting ui.toml
+    recovered. So the bytes must be identical before and after the refusal."""
+    from omnilingual.ui import settings
+
+    client, token = api
+    client.put("/api/settings", headers=_ok(token), json={"out": "/tmp/kept.md"})
+    before = settings.settings_path().read_bytes()
+
+    res = client.put("/api/settings", headers=_ok(token),
+                     content=b'{"max_cost": 1e400}')
+    assert res.status_code == 400
+    assert settings.settings_path().read_bytes() == before
+
+    # And the store is still usable: the poison did not land.
+    good = client.put("/api/settings", headers=_ok(token), json={"out": "probe.md"})
+    assert good.status_code == 200
+    assert "inf" not in settings.settings_path().read_text(encoding="utf-8")
 
 
 def test_a_corrupt_settings_store_does_not_stop_the_app(api):
@@ -1729,6 +1767,169 @@ def test_setup_routes_take_no_path_from_the_request(api, monkeypatch):
 def test_the_setup_script_is_the_one_in_the_repo():
     assert SCRIPT == server.REPO_ROOT / "scripts" / "setup-mac.sh"
     assert SCRIPT.is_file()
+
+
+def _script_shell():
+    """The launcher as text, read once per call so an edit is seen immediately."""
+    return SCRIPT.read_text(encoding="utf-8")
+
+
+def test_the_launcher_installs_the_ui_extra_by_default():
+    """The human ruling: ui is opted IN, so a fresh run installs the app.
+
+    A saved setup-mac.conf still overrides this (load_config), which is why the
+    handoff tells an existing user how to add ui rather than the script rewriting
+    their file — see the handoff assertions below.
+    """
+    body = _script_shell()
+    # The literal, not every EXTRAS= line: the script reassigns the variable later
+    # through sanitize() and prompt_extras().
+    default = re.search(r'^EXTRAS="([^"]*)"$', body, re.M)
+    assert default, "the launcher must ship a literal EXTRAS default"
+    extras = default.group(1).split(",")
+    assert "ui" in extras
+    # And the two it already carried, so this cannot pass by swapping one out.
+    assert {"local-stt", "diarize"} <= set(extras)
+
+
+def test_the_ui_extra_stays_deselectable():
+    """The human ruling forbids touching ALL_EXTRAS, and this says why.
+
+    ALL_EXTRAS is the union the convergence loop walks. A chosen extra is left out
+    of the --no-extra list and so gets installed; an unchosen one is subtracted.
+    Drop ui from ALL_EXTRAS and nothing can ever subtract it again — `uv sync
+    --all-extras` installs the app and a later run cannot remove it, which is the
+    permanent-install failure the ruling rules out. ui is already there, so the
+    assertion holds it in place.
+    """
+    body = _script_shell()
+    all_extras = re.search(r'^ALL_EXTRAS="([^"]*)"$', body, re.M)
+    assert all_extras, "ALL_EXTRAS must be a literal"
+    assert "ui" in all_extras.group(1).split()
+
+    # And the loop must subtract rather than only add: the sync line has to carry
+    # NO_EXTRA_ARGS, not be a bare `uv sync --all-extras`.
+    sync_line = next(line for line in body.splitlines()
+                     if "uv sync" in line and "NO_EXTRA_ARGS" in line)
+    assert not sync_line.strip().endswith("uv sync --all-extras"), (
+        "a bare --all-extras would install every extra permanently")
+    build = body[body.index("NO_EXTRA_ARGS=()"):body.index(sync_line)]
+    assert re.search(r'in_list "\$e" "\$EXTRAS" \|\| NO_EXTRA_ARGS\+=\(', build)
+
+
+def test_the_launcher_tells_a_ui_user_to_run_the_app():
+    body = _script_shell()
+    handoff = body[body.index("--- handoff"):]
+    assert "omnilingual-ui" in handoff
+
+
+def test_the_launcher_explains_how_to_add_ui_to_a_saved_config():
+    """load_config lets a saved EXTRAS= win over the default, so a user who ran the
+    launcher before this change sees no ui at all. The note has to name both the
+    file and the key, or it is not actionable."""
+    body = _script_shell()
+    handoff = body[body.index("--- handoff"):]
+    assert "EXTRAS=" in handoff
+    assert "setup-mac.conf" in handoff
+
+
+def test_prefetch_label_knows_about_ui():
+    """prefetch_label had no ui arm and was correct only because the prefetchable
+    gate sits between the check and the call. The arm is the explicit form: ui
+    ships wheels, not weights, so it has no label and must not claim a prefetch."""
+    body = _script_shell()
+    label_arm = body[body.index("prefetch_label() {"):body.index("prefetch_models()")]
+    assert re.search(r"^\s+ui\)", label_arm, re.M), (
+        "prefetch_label needs a ui arm so a dropped gate cannot print a lie")
+    assert "return 1" in label_arm
+
+
+def test_no_variable_expansion_runs_into_a_non_ascii_byte():
+    """bash 3.2 takes the byte after `$name` as part of the name, so `"$label…"`
+    looks up `label\\xef` and `set -u` aborts the script. It did exactly that at the
+    first model prefetch, so on macOS's system bash the launcher died before its
+    own handoff — including the ui line added in this wave. `${name}` is the fix."""
+    import re as _re
+
+    offenders = [
+        line for line in _script_shell().splitlines()
+        if _re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", line)
+        # The in-script usage banner quotes these lines on purpose.
+        and not line.lstrip().startswith(("#", "'"))
+    ]
+    assert offenders == [], (
+        "brace these, or bash 3.2 reads the next byte as part of the name: "
+        + "; ".join(offenders))
+
+
+def test_a_preview_does_not_hold_the_event_loop(env, monkeypatch):
+    """The preview runs a root-capable script synchronously and can take minutes.
+    This server has one event loop, so blocking it stalls every other request,
+    including the WebSocket a live run is streaming its rows over.
+
+    Driven as raw ASGI on one asyncio loop rather than through TestClient, on
+    purpose: TestClient gives each request its own portal and loop, so two
+    TestClient calls are never actually concurrent and the test would pass even
+    with the blocking call restored.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    blocked_at = []
+
+    def run(argv, **kwargs):
+        blocked_at.append(time.monotonic())
+        entered.set()
+        # Long enough that a blocked loop is unmistakable, short enough that a
+        # failing run of this test is not a minute of wall clock.
+        release.wait(timeout=5.0)
+        return subprocess.CompletedProcess(argv, 0, stdout="plan\n", stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", run)
+    token = mint_token()
+    app = create_app(token=token, port=PORT)
+
+    async def call(path):
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                 "method": "GET", "scheme": "http", "path": path,
+                 "raw_path": path.encode(), "query_string": b"",
+                 "root_path": "", "headers": [
+                     (b"host", HOST.encode()),
+                     (b"x-omnilingual-token", token.encode())],
+                 "client": ("127.0.0.1", 12345), "server": (HOST, PORT)}
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await asyncio.wait_for(app(scope, receive, send), timeout=15.0)
+        status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+        return status
+
+    async def main():
+        preview = asyncio.ensure_future(call("/api/setup/preview"))
+        for _ in range(200):  # wait for the blocking call to actually be entered
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert entered.is_set(), "the preview never started"
+        health = await call("/api/health")
+        # Measured from inside the blocking call, not from here: if the loop is
+        # blocked, *this* coroutine cannot run either, so timing from the line
+        # below would start measuring only after the stall had already ended and
+        # the test would pass on the broken code.
+        served_in = time.monotonic() - blocked_at[0]
+        release.set()
+        preview_status = await preview
+        return health, served_in, preview_status
+
+    health, served_in, preview_status = asyncio.run(main())
+    assert health == 200
+    assert preview_status == 200
+    assert served_in < 1.0, (
+        f"/api/health queued behind the preview for {served_in:.3f}s")
 
 
 # --- the event stream ------------------------------------------------------

@@ -9,6 +9,7 @@ world-readable.
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 import tempfile
@@ -104,6 +105,16 @@ def save(values) -> dict[str, object]:
         raise ValueError(f"unknown setting(s): {', '.join(unknown)}")
     merged = load()
     merged.update(values)
+
+    # Before anything is written, and this is the only place it has to be: the
+    # route serializes this returned dict with allow_nan=False, so a non-finite
+    # float becomes a 500 *after* save() already replaced the file. load() then
+    # reads the inf back and the store is permanently poisoned — every later save
+    # answers 500 too, and only deleting ui.toml recovers. Rejecting here means the
+    # 400 arrives with the previous store still intact.
+    for key, value in merged.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{key} must be a finite number (got {value!r})")
 
     directory = config_dir()
     directory.mkdir(parents=True, exist_ok=True)

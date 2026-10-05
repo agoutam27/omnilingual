@@ -413,6 +413,59 @@ def test_stop_event_stops_the_run(respx_mock, tmp_path):
 
 
 @respx.mock
+def test_a_falsy_stop_event_is_still_the_callers_flag(respx_mock, tmp_path):
+    """`stop_event or threading.Event()` reads truthiness, and threading.Event
+    defines no __bool__ — so it worked by accident. A host passing an Event-like
+    stand-in with __bool__ or __len__ (a queue, a sentinel, a future wrapper) would
+    have had its flag discarded for a fresh Event, and the run would never stop:
+    exactly the failure the parameter exists to prevent."""
+    _route(respx_mock)
+    pcm = raw_pcm([("silence", 1.0)]) + raw_pcm([("tone", 1.0)]) * 599
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    class FalsyEvent:
+        """An Event that is also empty — __len__ makes it falsy."""
+
+        def __init__(self):
+            self._inner = threading.Event()
+            self.fired = False
+
+        def is_set(self):
+            return self._inner.is_set()
+
+        def set(self):
+            self.fired = True
+            self._inner.set()
+
+        def wait(self, timeout=None):
+            return self._inner.wait(timeout)
+
+        def __len__(self):
+            return 0
+
+    stop = FalsyEvent()
+    assert not stop, "the stand-in must really be falsy for this to mean anything"
+    seen = []
+
+    def on_segment(seg, keep):
+        seen.append(seg)
+        stop.set()
+
+    code = run_live(_opts(tmp_path, stt_workers=1, target_s=7.0,
+                         min_chunk_s=5.0, max_chunk_s=14.0),
+                    settings, SarvamSTT(settings),
+                    MayuraTranslator(settings), status=lambda m: None,
+                    capture_factory=factory,
+                    on_segment=on_segment, stop_event=stop)
+    assert stop.fired, "the caller's flag must be the one the run watches"
+    assert code == 0
+    assert len(seen) < 10, "a falsy flag must still truncate the run"
+
+
+@respx.mock
 def test_run_live_works_off_the_main_thread(respx_mock, tmp_path):
     # The regression test for the SIGINT guard: signal.signal() raises
     # ValueError off the main thread, which is exactly how the UI calls it.

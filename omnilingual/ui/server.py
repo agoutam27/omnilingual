@@ -40,6 +40,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import anyio.to_thread
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -785,7 +786,12 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
     @app.get("/api/setup/preview")
     async def get_setup_preview(request: Request):
         try:
-            return {"output": _setup_preview()}
+            # Awaited off the loop, not detached like the streaming routes: this
+            # route's documented contract is a synchronous body, and phase 2's
+            # Setup screen expects the text in the response. Anyio's worker thread
+            # keeps that shape while leaving the one event loop free to serve
+            # /api/health and the WebSocket for the duration of the subprocess.
+            return {"output": await anyio.to_thread.run_sync(_setup_preview)}
         except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 

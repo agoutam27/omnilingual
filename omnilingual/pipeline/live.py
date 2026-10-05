@@ -218,7 +218,12 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
     state = {"accrued": 0.0, "halt": None, "enqueued": 0, "next": 0,
              "last_kept_end": 0.0, "sealed_end": 0.0, "sealed_n": 0,
              "appended_n": 0, "appended_end": 0.0, "bad": False, "died": False}
-    stop = stop_event or threading.Event()
+    # An explicit None check, not `stop_event or Event()`: `or` reads truthiness,
+    # and threading.Event defines no __bool__ so it works today by accident. A
+    # falsy stand-in would be discarded in favour of a fresh Event, so the
+    # caller's stop request would be silently dropped — the exact failure this
+    # parameter exists to prevent. Only None means "not provided".
+    stop = threading.Event() if stop_event is None else stop_event
     feeding_done = threading.Event()
     capture_done = threading.Event()
     t0 = time.monotonic()
@@ -448,7 +453,10 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
                 keep = False
             if on_segment is not None:
                 # After `keep` is known so the caller can mirror the file, and
-                # before the writers so a slow consumer cannot delay capture.
+                # before the writers so it holds the same lock-free ordering
+                # capture and the worker pool have. It does not keep capture
+                # running on its own: this call is synchronous, so a blocking
+                # callback stalls this appender thread until it returns.
                 try:
                     on_segment(seg, keep)
                 except Exception:  # noqa: BLE001 - a UI bug must not end the run

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import threading
@@ -222,21 +223,36 @@ def _numeric(values: Mapping[str, object], field: str, default,
     TypeError for None, and the spec's 400 path cannot catch either.
 
     Absent, null and blank all mean "not provided" and fall back to the field's
-    default, which is the same truthiness reading config.load_settings applies when
-    it turns env.get(...) into a key or None. Anything else is a mistake worth
-    naming, so the message says which field and what arrived: the user is looking
-    at a form, not at a traceback.
+    default — the same blank-as-absent reading this module already applies to
+    langs and the model fields above (`or ""` then `or None`). config.load_settings
+    does not set this precedent: it reads env.get(...) truthiness on the *value*,
+    not on whether a key is present. Anything else is a mistake worth naming, so
+    the message says which field and what arrived: the user is looking at a form,
+    not at a traceback.
     """
     raw = values.get(field)
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return default
     try:
-        return int(raw) if as_int else float(raw)
-    except (TypeError, ValueError) as exc:
+        number = int(raw) if as_int else float(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        # OverflowError is not hypothetical: JSON parses 1e400 as inf, and
+        # int(inf) raises it, so without this clause a numeric field posted at
+        # that magnitude escaped as a 500 rather than the 400 this raises.
         kind = "a whole number" if as_int else "a number"
         raise ConfigError(
             f"--{field.replace('_', '-')} must be {kind} (got {raw!r})"
         ) from exc
+    if not math.isfinite(number):
+        # float("1e400") succeeds and yields inf, so the except clause cannot
+        # catch this one. It has to be refused here or it reaches snapshot()'s
+        # cost_cap, where Starlette's send_json writes a bare Infinity token that
+        # JSON.parse rejects — and app.js's onmessage has no guard, so the throw
+        # loses every later frame, `end` included, while the run keeps spending.
+        raise ConfigError(
+            f"--{field.replace('_', '-')} must be a finite number (got {raw!r})"
+        )
+    return number
 
 
 def live_options(
@@ -674,8 +690,10 @@ class SessionRunner:
 
 
 # ConfigError is re-exported so a caller turning a bad start request into a 400
-# catches one exception type: build_run, live_options and free_output_path
-# raise ConfigError and nothing else, so one except clause is the whole 400 path.
+# catches one exception type: build_run and live_options raise ConfigError and
+# nothing else, so one except clause is the whole 400 path. (free_output_path
+# raises nothing — it renames rather than rejects, and can raise OSError from
+# path.exists(), which is not a validation failure.)
 __all__ = [
     "ConfigError",
     "SessionRunner",

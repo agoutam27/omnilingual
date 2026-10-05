@@ -179,7 +179,7 @@ trap cleanup EXIT
 ALL_EXTRAS="local-stt diarize local-mt ui"
 ALL_KEYS="SARVAM_API_KEY GROQ_API_KEY GEMINI_API_KEY"
 
-EXTRAS="local-stt,diarize"
+EXTRAS="local-stt,diarize,ui"
 KEYS=""
 LIVE_SETUP="no"
 ROUTE_OUTPUT="no"
@@ -427,6 +427,7 @@ extra_active() {
 prefetchable() {
     case "$1" in
         local-stt|diarize|local-mt) return 0 ;;
+        # ui is not here and does not need an arm: it ships wheels, not weights.
         *) return 1 ;;
     esac
 }
@@ -443,6 +444,12 @@ prefetch_label() {
         local-mt)
             printf 'IndicTrans2 int8 (~850 MB)'
             ;;
+        # Failing is the honest answer: ui ships wheels, not weights, so there is
+        # no label for it. The caller skips on failure, so this arm is what makes
+        # the function correct by construction rather than only because the
+        # prefetchable gate happens to sit between the check and the call.
+        ui) return 1 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -718,7 +725,11 @@ if yes_no "$PREFETCH"; then
         in_list "$e" "$EXTRAS" || continue
         prefetchable "$e" || continue
         label="$(prefetch_label "$e")"
-        step "pre-downloading $label…"
+        # Braces, not "$label…": bash 3.2 reads the byte after $label as part of
+        # the name, so the UTF-8 ellipsis becomes "label\xef" and `set -u` aborts
+        # the whole script at the first prefetch. It has been failing this way
+        # since the ellipsis landed, on every macOS that still ships bash 3.2.
+        step "pre-downloading ${label}…"
         if prefetch_models "$e"; then
             ok "$label ready"
         else
@@ -759,6 +770,18 @@ fi
     fi
     if yes_no "$LIVE_SETUP"; then
         printf '    uv run omnilingual live --out standup.md   # Ctrl+C stops; the file stays valid\n'
+    fi
+    # The two lines below are the whole of the ui handoff, and both are
+    # conditional: the EXTRAS default now carries ui, but load_config lets a
+    # saved setup-mac.conf override it, so a user who ran this script before the
+    # default changed sees no ui at all. Telling them the line to edit beats
+    # editing their saved answers, which would silently answer a question they
+    # were never asked.
+    if in_list ui "$EXTRAS"; then
+        printf '    uv run omnilingual-ui                     # the windowed app\n'
+    else
+        say "ui is not installed: your saved EXTRAS= overrides the default that now includes it."
+        say "add ui to EXTRAS= in $CONFIG_FILE (or re-run and answer yes), then re-run this script."
     fi
     printf '\n'
 } >&2

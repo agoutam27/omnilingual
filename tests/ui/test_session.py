@@ -1161,6 +1161,35 @@ def test_live_options_rejects_a_bad_number_the_same_way(override, field, tmp_pat
         live_options(override, out=tmp_path / "x.md")
 
 
+@pytest.mark.parametrize("override,field", [
+    ({"num_speakers": 1e400}, "num-speakers"),
+    ({"num_speakers": float("inf")}, "num-speakers"),
+])
+def test_a_non_finite_speaker_count_is_a_configerror(override, field,
+                                                     tmp_path, monkeypatch):
+    """1e400 arrives as the float inf. int(inf) raises OverflowError, which is
+    neither TypeError nor ValueError, so the old except tuple let it escape as a
+    500 instead of the 400 the panel renders."""
+    _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SARVAM_API_KEY", "k")
+    panel = {"mode": "live", "stt": "sarvam", "mt": "mayura", "langs": []}
+    panel.update(override)
+
+    with pytest.raises(ConfigError, match=field):
+        build_run(panel)
+
+
+@pytest.mark.parametrize("bad", [1e400, float("inf"), float("nan"), "inf"])
+def test_a_non_finite_cost_cap_is_a_configerror(bad, tmp_path):
+    """float("1e400") *succeeds* and yields inf, so no except clause can catch it.
+    Allowed through, it reaches snapshot()'s cost_cap, and Starlette's send_json
+    does not pass allow_nan=False — so the wire carries a bare Infinity token,
+    JSON.parse throws, and app.js's unguarded onmessage loses every later frame
+    including `end`, while the run keeps spending quota."""
+    with pytest.raises(ConfigError, match="max-cost"):
+        live_options({"max_cost": bad}, out=tmp_path / "x.md")
+
+
 @pytest.mark.parametrize("blank", [None, "", "   "])
 def test_a_cleared_numeric_field_falls_back_to_its_default(blank, tmp_path, monkeypatch):
     """Absent, null and blank all mean "not provided". Rejecting them would fail
