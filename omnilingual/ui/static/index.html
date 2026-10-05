@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omnilingual</title>
+</head>
+<body>
+<header>
+  <h1>omnilingual</h1>
+  <div id="banner" class="banner hidden" role="status"></div>
+</header>
+
+<main>
+  <section id="panel">
+    <div class="modes">
+      <label><input type="radio" name="mode" value="live" checked> Live</label>
+      <label><input type="radio" name="mode" value="recording"> Recording</label>
+    </div>
+
+    <label>Recording file
+      <input id="source" type="text" placeholder="/path/to/meeting.m4a"></label>
+    <label>Output file
+      <input id="out" type="text" placeholder="standup.md"></label>
+
+    <label>Speech-to-text <select id="stt"></select></label>
+    <label>STT model
+      <input id="stt_model" type="text" placeholder="provider default"></label>
+
+    <label>Translate <select id="mt"></select></label>
+    <label>MT model
+      <input id="mt_model" type="text" placeholder="provider default"></label>
+
+    <label class="check"><input id="diarize" type="checkbox"> Label speakers</label>
+    <label>Speakers <input id="num_speakers" type="number" min="2" step="1"></label>
+    <label>Languages
+      <input id="langs" type="text" placeholder="blank = auto-detect"></label>
+    <label class="check"><input id="english_only" type="checkbox">
+      Also write an English-only file</label>
+    <label>Work directory
+      <input id="work_dir" type="text"
+             placeholder="blank = .omnilingual beside the output"></label>
+
+    <fieldset id="live-only">
+      <legend>Live capture</legend>
+      <label>Device <input id="device" type="text"></label>
+      <label class="check"><input id="mic_only" type="checkbox"> Microphone only</label>
+      <label>Target seconds
+        <input id="target_s" type="number" step="0.5"></label>
+      <label>Max chunk s
+        <input id="max_chunk_s" type="number" step="0.5"></label>
+      <label>Min chunk s
+        <input id="min_chunk_s" type="number" step="0.5"></label>
+      <label>Noise floor dBFS
+        <input id="noise_db" type="number" step="1"></label>
+      <label>STT workers
+        <input id="stt_workers" type="number" min="1" step="1"></label>
+      <label>Cost cap Rs
+        <input id="max_cost" type="number" step="1"></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>API keys</legend>
+      <div id="keys"></div>
+    </fieldset>
+
+    <div class="actions">
+      <button id="start" type="button">Start</button>
+      <button id="stop" type="button" disabled>Stop</button>
+      <button id="setup-audio" type="button">Set up audio</button>
+      <button id="restart-daemon" type="button">Restart audio daemon</button>
+    </div>
+  </section>
+
+  <section id="output">
+    <div id="status" class="status" data-status="idle"></div>
+    <div id="audio" class="audio"></div>
+    <div id="summary" class="summary"></div>
+    <div id="log" class="log"></div>
+    <table id="rows">
+      <thead>
+        <tr><th>Time</th><th>Lang</th><th>Speaker</th><th>Note</th>
+            <th>Original</th><th>English</th></tr>
+      </thead>
+      <tbody id="rows-body"></tbody>
+    </table>
+    <div id="final" class="final hidden"></div>
+
+    <fieldset id="past">
+      <legend>Saved sessions</legend>
+      <div id="runs"></div>
+    </fieldset>
+  </section>
+</main>
+
+<script>
+// The static mount is token-guarded like every other path, so a plain
+// <script src> or <link href> arrives with no X-Omnilingual-Token and is
+// answered with a 403. /token.js is the one unguarded file the page may read,
+// so the token comes from there and the two assets are fetched with it. Nothing
+// is inlined here and nothing is fetched off-origin.
+(async () => {
+  const TOKEN_HEADER = "X-Omnilingual-Token";
+  // /token.js is a script, not JSON: fetching it does not run it, so its text is
+  // executed before the token it sets can be read.
+  const tokenScript = document.createElement("script");
+  tokenScript.textContent = await (await fetch("/token.js")).text();
+  document.head.appendChild(tokenScript);
+
+  const token = window.OMNILINGUAL_TOKEN;
+  const guarded = (path) =>
+    fetch(path, { headers: { [TOKEN_HEADER]: token } });
+
+  const style = document.createElement("style");
+  style.textContent = await (await guarded("/static/style.css")).text();
+  document.head.appendChild(style);
+
+  const code = document.createElement("script");
+  code.textContent = await (await guarded("/static/app.js")).text();
+  document.body.appendChild(code);
+})().catch((err) => {
+  const banner = document.getElementById("banner");
+  banner.textContent = `the page's own files could not be loaded: ${err.message}`;
+  banner.className = "banner error";
+});
+</script>
+</body>
+</html>
