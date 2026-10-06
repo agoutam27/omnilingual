@@ -295,8 +295,16 @@ def test_on_cost_reports_the_delta_and_the_running_total(respx_mock, tmp_path):
 
 @respx.mock
 def test_on_cost_fires_for_a_dropped_silence_too(respx_mock, tmp_path):
-    """A dropped chunk costs nothing, but the consumer must still be told, so
-    the number of calls matches the number of sealed chunks."""
+    """A dropped chunk still costs money when the provider was already called.
+
+    This is the honesty test. `live.py` has two `no_speech` sources: a chunk
+    VAD rejected never reaches the provider and costs `0.0`, but a chunk the
+    provider answered with whitespace IS billed and carries a non-zero delta
+    even though the appender drops it from the file. So the total the user
+    actually paid is the sum of every delta, while `accrued` — the pipeline's
+    own cap counter, accumulated inside `if keep:` — omits the dropped one.
+    A consumer that adopts `accrued` would under-report the bill.
+    """
     _route(respx_mock, texts=("Bravo", "   ", "Vanakkam"))
     pcm = _pcm_3x20()
     factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
@@ -311,7 +319,12 @@ def test_on_cost_fires_for_a_dropped_silence_too(respx_mock, tmp_path):
              on_cost=lambda delta, accrued: calls.append((delta, accrued)))
 
     assert len(calls) == 3, f"expected one call per sealed chunk, got {calls}"
-    assert calls[1][0] == 0.0, "the dropped silence must report a zero delta"
+    assert calls[1][0] > 0, (
+        f"the whitespace chunk was billed, so its delta is not zero: {calls}")
+    paid = sum(delta for delta, _ in calls)
+    assert paid > calls[-1][1], (
+        f"accrued {calls[-1][1]} excludes the dropped-but-billed chunk; the true "
+        f"spend is {paid}, so the consumer must accumulate delta itself")
 
 
 @respx.mock
@@ -354,10 +367,16 @@ with a docstring line beside the existing `on_segment` docs:
 
 ```
     on_cost is called as ``on_cost(delta, accrued)`` once per sealed segment,
-    after that segment's cost is folded into the running total: ``delta`` is
-    this segment's cost in INR (0.0 for a dropped silence) and ``accrued`` is
-    the total after folding it in. Callback exceptions are swallowed for the
-    same reason as ``on_segment`` — a consumer's bug must not end a meeting.
+    including one the appender drops. ``delta`` is that chunk's billed cost in
+    INR; it is ``0.0`` only when the voice-activity gate rejected the chunk
+    before the provider was called. A provider that answered with whitespace
+    was still billed, so its dropped segment carries a non-zero delta.
+    ``accrued`` is the pipeline's own running total, accumulated inside the
+    ``if keep:`` branch — it therefore OMITS dropped-but-billed chunks and is
+    the cap counter, not the amount the user paid. A consumer displaying spend
+    must accumulate ``delta`` itself rather than adopt ``accrued``.
+    Callback exceptions are swallowed for the same reason as ``on_segment`` —
+    a consumer's bug must not end a meeting.
 ```
 
 Then **after the whole `if keep:` block** — that is, after `state["accrued"] += delta` *and* its trailing `state["bad"] = True` line, dedented back out to the appender's own level:
@@ -466,14 +485,21 @@ Then replace the dead line in `_on_segment`. Its current body accumulates from a
 
 ```python
     def _on_cost(self, delta: float, accrued: float) -> None:
-        """A live run's running spend. `accrued` is authoritative — it is the
-        pipeline's own total after folding this segment in, not a sum we keep
-        separately, so it cannot drift from the transcript the run is writing.
+        """A live run's running spend, accumulated from every sealed chunk.
+
+        Deliberately NOT `self._cost = accrued`. `accrued` is the pipeline's
+        cap counter, folded in inside the `if keep:` branch, so it omits a
+        chunk that was billed but then dropped from the file — a provider that
+        answered with whitespace. Adopting it would under-report what the user
+        actually paid, and a silently dropped charge is the worst failure a
+        money display can have. `accrued` is accepted and ignored; `delta` is
+        the truth, and summing it over every sealed chunk is the real bill.
         """
-        self._cost = accrued
+        with self._lock:
+            self._cost += delta
 ```
 
-Keep the `self._cost += delta` removal minimal: the field is read under `self._lock` by `snapshot()`, and `_on_cost` runs on the pipeline's ordered emitter thread, so take the lock the same way `_on_segment` does.
+Keep the change minimal: the field is read under `self._lock` by `snapshot()`, and `_on_cost` runs on the pipeline's ordered emitter thread, so take the lock the same way `_on_segment` does.
 
 Update `_on_segment`'s signature comment to record that its third parameter is no longer the source of truth.
 
