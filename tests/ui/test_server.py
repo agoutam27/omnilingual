@@ -47,7 +47,9 @@ RESERVED = [
     ("GET", "/api/runs"),
     ("POST", "/api/session/recover"),
     ("GET", "/api/setup/preview"),
+    ("POST", "/api/setup/preview"),
     ("POST", "/api/setup/apply"),
+    ("POST", "/api/relaunch"),
 ]
 
 FAKE_KEY = "test-key-not-a-credential"
@@ -882,7 +884,7 @@ def test_a_long_operation_never_holds_the_event_loop(api, monkeypatch, route):
     _block(route, monkeypatch, release)
     client, token = api
     started = time.monotonic()
-    res = client.post(route, headers=_ok(token))
+    res = client.post(route, headers=_ok(token), json={})
     elapsed = time.monotonic() - started
     try:
         # Still serving while the operation is in flight: this request would queue
@@ -1728,7 +1730,7 @@ def test_setup_apply_streams_on_the_log_channel(api, monkeypatch):
 
     monkeypatch.setattr(server.subprocess, "Popen", popen)
     client, token = api
-    res = client.post("/api/setup/apply", headers=_ok(token))
+    res = client.post("/api/setup/apply", headers=_ok(token), json={})
     assert res.status_code == 200
     assert "--dry-run" not in seen["argv"]
     assert "--yes" in seen["argv"]
@@ -1739,7 +1741,7 @@ def test_setup_apply_reports_a_failure(api, monkeypatch):
     monkeypatch.setattr(server.subprocess, "Popen",
                         lambda argv, **kw: _FakeProc(["==> failed\n"], code=1))
     client, token = api
-    res = client.post("/api/setup/apply", headers=_ok(token))
+    res = client.post("/api/setup/apply", headers=_ok(token), json={})
     assert res.status_code == 200
     assert _wait_for_logs(client, 2) == [
         "==> failed", "RuntimeError: setup-mac.sh exited 1"]
@@ -1749,7 +1751,11 @@ def test_setup_apply_reports_a_failure(api, monkeypatch):
 
 
 def test_setup_routes_take_no_path_from_the_request(api, monkeypatch):
-    """Nothing a request sends may reach the argv of a root-privileged script."""
+    """Nothing a request sends may reach the argv of a root-privileged script.
+
+    Unknown fields are refused before the script starts, so the refusal
+    itself is the guarantee: the argv is never built.
+    """
     seen = {}
 
     def popen(argv, **kwargs):
@@ -1758,10 +1764,10 @@ def test_setup_routes_take_no_path_from_the_request(api, monkeypatch):
 
     monkeypatch.setattr(server.subprocess, "Popen", popen)
     client, token = api
-    client.post("/api/setup/apply", headers=_ok(token),
-                json={"repo": "; touch /tmp/pwned"})
-    assert _wait_until(lambda: "argv" in seen)
-    assert seen["argv"] == [str(SCRIPT), "--yes"]
+    res = client.post("/api/setup/apply", headers=_ok(token),
+                      json={"repo": "; touch /tmp/pwned"})
+    assert res.status_code == 400
+    assert "argv" not in seen
 
 
 def test_the_setup_script_is_the_one_in_the_repo():
@@ -1821,6 +1827,105 @@ def test_the_launcher_tells_a_ui_user_to_run_the_app():
     body = _script_shell()
     handoff = body[body.index("--- handoff"):]
     assert "omnilingual-ui" in handoff
+
+
+CAPABILITIES = {"extras": "diarize", "live_setup": False, "route_output": False,
+                "prefetch": True, "run_tests": False}
+
+
+def test_preview_passes_the_capabilities_to_the_script(api, monkeypatch):
+    """The flags reach argv; they are never interpolated into a shell string."""
+    client, token = api
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "extras enabled : diarize", "")
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+    response = client.post("/api/setup/preview", json=CAPABILITIES, headers=_ok(token))
+
+    assert response.status_code == 200, response.text
+    argv = seen[0]
+    assert argv[1:3] == ["--extras", "diarize"], f"argv was {argv}"
+    assert "--live-setup" in argv and "no" in argv
+    assert "--route-output" in argv and "no" in argv
+    assert "--prefetch" in argv and "yes" in argv
+    assert "--run-tests" in argv and "no" in argv
+    assert "--dry-run" in argv
+    assert argv[-1] == "--yes", f"--yes must stay last, argv was {argv}"
+
+
+def test_preview_refuses_an_unknown_extra(api):
+    client, token = api
+    response = client.post("/api/setup/preview", headers=_ok(token),
+                           json={**CAPABILITIES, "extras": "local-stt;rm -rf /"})
+    assert response.status_code == 400
+    assert "rm -rf" not in response.text
+
+
+def test_preview_refuses_an_unknown_capability_name(api):
+    client, token = api
+    response = client.post("/api/setup/preview", headers=_ok(token),
+                           json={**CAPABILITIES, "sudo": True})
+    assert response.status_code == 400
+
+
+def test_apply_passes_the_capabilities_to_the_script(api, monkeypatch):
+    client, token = api
+    seen: list[list[str]] = []
+    monkeypatch.setattr(server.subprocess, "Popen",
+                        lambda argv, **kw: (seen.append(list(argv)), _FakeProc())[1])
+
+    response = client.post("/api/setup/apply", json=CAPABILITIES, headers=_ok(token))
+
+    assert response.status_code == 200
+    assert response.json() == {"started": True}
+    assert "--run-tests" in seen[0] and "no" in seen[0]
+
+
+def test_apply_never_passes_a_key_to_the_script(api, monkeypatch):
+    """`keys` is not an accepted field: the screen must never hold a secret.
+
+    The refusal happens before the script starts, so no argv exists to inspect.
+    """
+    client, token = api
+    seen: list[list[str]] = []
+    monkeypatch.setattr(server.subprocess, "Popen",
+                        lambda argv, **kw: (seen.append(list(argv)), _FakeProc(()))[1])
+
+    res = client.post("/api/setup/apply", headers=_ok(token),
+                      json={**CAPABILITIES, "keys": "SARVAM_API_KEY=sk-live-abc"})
+
+    assert res.status_code == 400
+    assert seen == []
+
+
+def test_relaunch_reexecutes_a_fixed_argv(api, monkeypatch):
+    """The relaunch must not take its command from the request.
+
+    The exec is deferred past the response (the process image is replaced,
+    so answering first is the only way the page learns the restart began),
+    hence the poll rather than an immediate assertion. A daemon thread
+    carries the delay: loop timers scheduled during a request never fire
+    under TestClient, so call_later would be unobservable.
+    """
+    client, token = api
+    calls: list[list[str]] = []
+    monkeypatch.setattr(server, "_relaunch_argv", lambda: ["python", "-m", "omnilingual.ui"])
+    monkeypatch.setattr(server.os, "execv", lambda path, argv: calls.append(list(argv)))
+
+    response = client.post("/api/relaunch", headers=_ok(token))
+
+    assert response.status_code == 200
+    assert response.json() == {"restarting": True}
+    assert _wait_until(lambda: calls == [["python", "-m", "omnilingual.ui"]])
+
+
+def test_relaunch_is_token_guarded(api):
+    client, _ = api
+    assert client.post("/api/relaunch").status_code == 403
 
 
 def test_the_launcher_explains_how_to_add_ui_to_a_saved_config():

@@ -31,12 +31,14 @@ confined to this file so the CLI keeps no web dependency.
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
 import secrets as pysecrets
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Iterator, Mapping
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -515,6 +517,39 @@ def _stream(state: AppState, loop: asyncio.AbstractEventLoop,
 # --- the setup script ------------------------------------------------------
 
 
+_SETUP_EXTRAS = ("local-stt", "diarize", "local-mt", "ui")
+
+
+def _capability_flags(body: dict) -> list[str]:
+    """Validated capability flags for setup-mac.sh.
+
+    Every value below is either a literal from _SETUP_EXTRAS or a yes/no this
+    function produces, so nothing from the request reaches argv unfiltered.
+    Raises ConfigError, which the routes already map to 400.
+    """
+    unknown = set(body) - {"extras", "live_setup", "route_output", "prefetch", "run_tests"}
+    if unknown:
+        raise ConfigError(f"unknown setup field(s): {', '.join(sorted(unknown))}")
+
+    chosen: list[str] = []
+    for name in str(body.get("extras", "")).split(","):
+        name = name.strip()
+        if not name:
+            continue
+        if name not in _SETUP_EXTRAS:
+            raise ConfigError("unknown extra")
+        if name not in chosen:
+            chosen.append(name)
+
+    flags = ["--extras", ",".join(chosen)]
+    for name, value in (("live_setup", body.get("live_setup")),
+                        ("route_output", body.get("route_output")),
+                        ("prefetch", body.get("prefetch")),
+                        ("run_tests", body.get("run_tests"))):
+        flags += [f"--{name.replace('_', '-')}", "yes" if value else "no"]
+    return flags
+
+
 def _setup_argv(*flags: str) -> list[str]:
     """argv for setup-mac.sh. Nothing from a request reaches it.
 
@@ -524,33 +559,43 @@ def _setup_argv(*flags: str) -> list[str]:
     return [str(SETUP_SCRIPT), *flags, "--yes"]
 
 
-def _setup_lines() -> Iterator[str]:
+def _relaunch_argv() -> list[str]:
+    """The command that started this process, reconstructed from fixed parts.
+
+    Never reads the request. sys.argv[0] and the interpreter are the only inputs,
+    both of which the host chose at launch, so nothing a client sends can reach
+    the exec.
+    """
+    return [sys.executable, "-m", "omnilingual.ui", *sys.argv[1:]]
+
+
+def _setup_lines(flags: Sequence[str]) -> Iterator[str]:
     """setup-mac.sh's own output, on both streams, as it is written.
 
     stderr is merged into stdout because the script writes everything
     human-facing there and keeps stdout for captured values, and it is iterated
     lazily because the install runs for minutes.
     """
-    process = subprocess.Popen(_setup_argv(), stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True,
-                               errors="replace")
+    proc = subprocess.Popen(_setup_argv(*flags), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            errors="replace")
     try:
-        for raw in process.stdout:
+        for raw in proc.stdout:
             yield raw.rstrip("\n")
-        code = process.wait(timeout=_SETUP_TIMEOUT)
+        code = proc.wait(timeout=_SETUP_TIMEOUT)
     finally:
-        process.stdout.close()
+        proc.stdout.close()
     if code != 0:
         raise RuntimeError(f"setup-mac.sh exited {code}")
 
 
-def _setup_preview() -> str:
+def _setup_preview(flags: Sequence[str] | None = None) -> str:
     """The script's dry-run text. Both streams joined, as above, but read in one
     go: the preview must not write anything, so it needs no log channel, and a
     dry run finishes in seconds."""
-    done = subprocess.run(_setup_argv("--dry-run"), capture_output=True, text=True,
-                          timeout=_SETUP_TIMEOUT, errors="replace")
-    if done.returncode != 0:
+    done = subprocess.run(_setup_argv(*(flags or []), "--dry-run"),
+                          text=True, errors="replace", timeout=_SETUP_TIMEOUT)
+    if done.returncode:
         raise RuntimeError(f"setup-mac.sh exited {done.returncode}")
     return (done.stdout or "") + (done.stderr or "")
 
@@ -796,9 +841,14 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     @app.post("/api/setup/apply")
-    async def post_setup_apply(request: Request):
+    async def post_setup_apply(request: Request) -> dict:
         loop = asyncio.get_running_loop()
-        _background(lambda: _stream(state, loop, _setup_lines()))
+        body = await request.json()
+        try:
+            flags = _capability_flags(body)
+        except ConfigError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        _background(lambda: _stream(state, loop, _setup_lines(flags)))
         return {"started": True}
 
     @app.websocket("/ws")
@@ -898,5 +948,34 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.post("/api/relaunch")
+    async def post_relaunch(request: Request) -> dict:
+        if request.headers.get(TOKEN_HEADER) != state.token:
+            return JSONResponse({"error": "bad token"}, status_code=403)
+        argv = _relaunch_argv()
+
+        def delayed() -> None:
+            # The response must flush before this process image is replaced.
+            # A thread carries the delay: loop timers are unobservable here.
+            time.sleep(0.2)
+            os.execv(sys.executable, argv)
+
+        _background(delayed)
+        return {"restarting": True}
+
+    @app.post("/api/setup/preview")
+    async def post_setup_preview(request: Request) -> dict:
+        loop = asyncio.get_running_loop()
+        body = await request.json()
+        try:
+            flags = _capability_flags(body)
+        except ConfigError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
+            output = await anyio.to_thread.run_sync(_setup_preview, flags)
+        except (RuntimeError, OSError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return {"output": output}
 
     return app
