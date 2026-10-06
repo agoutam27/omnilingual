@@ -166,7 +166,7 @@ In `scripts/setup-mac.sh`, first extend the header comment so `usage()` picks it
 #   value is written back, so re-running converges instead of re-asking.
 ```
 
-Next, add the declarations. Immediately after `RUN_TESTS="yes"` insert:
+Next, add the declarations. **Immediately after `BRANCH_SET=0`** — the last of the four pre-loop declarations at `setup-mac.sh:64-67`, i.e. still ABOVE the `while [[ $# -gt 0 ]]` parse loop — insert:
 
 ```bash
 # Explicit flags for this run. Empty means "not given", which is what lets the
@@ -184,6 +184,16 @@ ROUTE_OUTPUT_SET=0
 PREFETCH_SET=0
 RUN_TESTS_SET=0
 ```
+
+> **The anchor matters, and getting it wrong silently disables every flag.** `RUN_TESTS="yes"`
+> lives at `setup-mac.sh:206`, far below the parse loop at `:76-92`. Declaring `EXTRAS_SET=0`
+> *there* means the declaration executes after the parser has already written
+> `EXTRAS_SET=1`, so it resets the flag back to `0`, the restore block never fires, and
+> `--extras` is accepted, echoed in `--help`, and then discarded — the feature looks
+> present and does nothing. `REPO_URL_SET` and `BRANCH_SET` work precisely because they
+> are declared at `:64-67`, above the loop. Put these six next to them, and verify with
+> `bash -x scripts/setup-mac.sh --extras diarize --dry-run --yes 2>&1 | grep -n EXTRAS_SET`
+> that the order is `0` (declaration) then `1` (parser) — never the reverse.
 
 Next, add the case arms. Inside the `while [[ $# -gt 0 ]]` loop, after the `--branch)` arm:
 
