@@ -594,6 +594,7 @@ def _setup_preview(flags: Sequence[str] | None = None) -> str:
     go: the preview must not write anything, so it needs no log channel, and a
     dry run finishes in seconds."""
     done = subprocess.run(_setup_argv(*(flags or []), "--dry-run"),
+                          capture_output=True,
                           text=True, errors="replace", timeout=_SETUP_TIMEOUT)
     if done.returncode:
         raise RuntimeError(f"setup-mac.sh exited {done.returncode}")

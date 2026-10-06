@@ -1709,6 +1709,20 @@ def test_setup_preview_returns_the_scripts_own_text(api, monkeypatch):
     assert "--yes" in seen["argv"]
 
 
+def test_setup_preview_returns_real_script_output(api, monkeypatch, tmp_path):
+    """No stub: the real script's dry-run text must reach the response body.
+
+    A missing stdout capture in _setup_preview lets the script inherit the
+    server's own stdout, so the response is {"output": ""} while the plan
+    text lands in the server log. Dry-run changes nothing on disk.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    client, token = api
+    res = client.get("/api/setup/preview", headers=_ok(token))
+    assert res.status_code == 200
+    assert "extras enabled" in res.json()["output"]
+
+
 def test_setup_preview_reports_a_refusal(api, monkeypatch):
     def run(argv, **kwargs):
         raise subprocess.CalledProcessError(2, argv, stderr="boom")
