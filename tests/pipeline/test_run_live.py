@@ -494,3 +494,83 @@ def test_run_live_works_off_the_main_thread(respx_mock, tmp_path):
     assert not th.is_alive(), "run_live hung when driven from a worker thread"
     assert "error" not in box, f"run_live raised off the main thread: {box.get('error')!r}"
     assert box["code"] == 0
+
+
+@respx.mock
+def test_on_cost_reports_the_delta_and_the_running_total(respx_mock, tmp_path):
+    """Each callback carries that segment's cost and the total after it."""
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    seen = []
+    run_live(_opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+             MayuraTranslator(settings), status=lambda m: None,
+             capture_factory=factory,
+             on_cost=lambda delta, accrued: seen.append((delta, accrued)))
+
+    assert seen, "on_cost never fired"
+    deltas = [delta for delta, _ in seen]
+    assert any(delta > 0 for delta in deltas), f"no cost was reported: {seen}"
+    running = 0.0
+    for delta, accrued in seen:
+        running += delta
+        assert abs(accrued - running) < 1e-9, f"{accrued} != running {running}"
+
+
+@respx.mock
+def test_on_cost_fires_for_a_dropped_silence_too(respx_mock, tmp_path):
+    """A dropped chunk still costs money when the provider was already called.
+
+    This is the honesty test. `live.py` has two `no_speech` sources: a chunk
+    VAD rejected never reaches the provider and costs `0.0`, but a chunk the
+    provider answered with whitespace IS billed and carries a non-zero delta
+    even though the appender drops it from the file. So the total the user
+    actually paid is the sum of every delta, while `accrued` — the pipeline's
+    own cap counter, accumulated inside `if keep:` — omits the dropped one.
+    A consumer that adopts `accrued` would under-report the bill.
+    """
+    _route(respx_mock, texts=("Bravo", "   ", "Vanakkam"))
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    calls = []
+    run_live(_opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+             MayuraTranslator(settings), status=lambda m: None,
+             capture_factory=factory,
+             on_cost=lambda delta, accrued: calls.append((delta, accrued)))
+
+    assert len(calls) == 3, f"expected one call per sealed chunk, got {calls}"
+    assert calls[1][0] > 0, (
+        f"the whitespace chunk was billed, so its delta is not zero: {calls}")
+    paid = sum(delta for delta, _ in calls)
+    assert paid > calls[-1][1], (
+        f"accrued {calls[-1][1]} excludes the dropped-but-billed chunk; the true "
+        f"spend is {paid}, so the consumer must accumulate delta itself")
+
+
+@respx.mock
+def test_a_raising_on_cost_does_not_end_the_run(respx_mock, tmp_path):
+    """A UI rendering bug in the cost callback must not kill a live meeting."""
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    def boom(delta, accrued):
+        raise RuntimeError("the callback is broken")
+
+    code = run_live(_opts(tmp_path, stt_workers=1), settings, SarvamSTT(settings),
+                    MayuraTranslator(settings), status=lambda m: None,
+                    capture_factory=factory, on_cost=boom)
+
+    assert code == 0, "a raising on_cost ended the run"
+    assert (tmp_path / "meeting.md").exists()

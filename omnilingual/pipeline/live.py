@@ -148,8 +148,9 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
              diarizer=None,
              status: Callable[[str], None] | None = None,
              capture_factory: Callable = LiveCapture,
-             on_segment: Callable[[Segment, bool], None] | None = None,
-             stop_event: threading.Event | None = None) -> int:
+              on_segment: Callable[[Segment, bool], None] | None = None,
+              stop_event: threading.Event | None = None,
+              on_cost: Callable[[float, float], None] | None = None) -> int:
     """Run a live session. Returns the process exit code (0/1/2).
 
     on_segment(seg, keep) is the structured counterpart to the pre-rendered
@@ -159,6 +160,15 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
     is logged and swallowed — UI code must not be able to end the session.
     stop_event lets a host that owns SIGINT (a GUI server) stop the run without
     sending a signal.
+    on_cost(delta, accrued) reports spend: ``delta`` is this sealed chunk's
+    billed cost in INR — ``0.0`` only when the voice-activity gate rejected
+    the chunk before the provider was called. A provider that answered with
+    whitespace was still billed, so its dropped segment carries a non-zero
+    delta. ``accrued`` is the pipeline's own running total, accumulated inside
+    the ``if keep:`` branch — it therefore OMITS dropped-but-billed chunks and
+    is the cap counter, not the amount the user paid. A consumer displaying
+    spend must accumulate ``delta`` itself rather than adopt ``accrued``.
+    A raising callback is logged and swallowed, like ``on_segment``.
     """
     say = status or (lambda msg: None)
     root = opts.work_root or opts.out.parent / ".omnilingual"
@@ -471,6 +481,16 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
                     state["last_kept_end"] = seg.chunk.end_s
                     if seg.status != "ok":
                         state["bad"] = True
+            if on_cost is not None:
+                # After the total is folded in, so `accrued` is never stale, and
+                # outside `if keep` so a dropped silence still reports instead
+                # of leaving the page's running total looking frozen. Reading
+                # `accrued` without `mlock` is safe: this appender thread is its
+                # only writer, and the read happens on that same thread.
+                try:
+                    on_cost(delta, state["accrued"])
+                except Exception:  # noqa: BLE001 - a UI bug must not end the run
+                    log.exception("on_cost callback failed")
             now = time.monotonic()
             if now - last_lag_log >= 30.0:
                 last_lag_log = now
