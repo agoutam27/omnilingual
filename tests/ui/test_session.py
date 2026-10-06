@@ -566,6 +566,28 @@ def test_run_env_resolves_keys_the_way_present_does(body, expected, tmp_path, mo
     assert bool(secrets.present()["SARVAM_API_KEY"]) is bool(expected)
 
 
+def test__on_cost_accumulates_delta_not_accrued(tmp_path):
+    """Verify _on_cost uses delta accumulation, not accrued-override.
+
+    Under the shipped accumulate (`self._cost += delta`):
+      - _on_cost(0.25, 0.0) on a dropped-but-billed chunk adds 0.25
+      - _on_cost(0.25, 0.25) on a kept chunk adds another 0.25
+      - snapshot()["cost_inr"] == 0.5
+
+    Under the adopt-mutation (`self._cost = accrued`):
+      - _on_cost(0.25, 0.0) sets cost to 0.0 (accrued excludes dropped chunk)
+      - _on_cost(0.25, 0.25) sets cost to 0.25 (accrued = kept chunk cost)
+      - snapshot()["cost_inr"] == 0.25 (wrong — under-reports spend on dropped-but-billed chunks)
+    """
+    from omnilingual.ui.session import SessionRunner
+    from tests.ui.test_session import Collector
+
+    runner = SessionRunner(run_id="r1", queue=Collector())
+    runner._on_cost(0.25, 0.0)   # dropped-but-billed: delta>0, accrued excludes it
+    runner._on_cost(0.25, 0.25)  # kept chunk
+    assert runner.snapshot()["cost_inr"] == pytest.approx(0.5)
+
+
 def test_a_blank_final_assignment_exposes_the_environment_not_an_earlier_line(
     tmp_path, monkeypatch
 ):
