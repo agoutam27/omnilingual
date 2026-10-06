@@ -450,10 +450,27 @@ function renderState(message) {
     `${message.segments} segment${message.segments === 1 ? "" : "s"}`,
   ];
   if (message.dropped) summary.push(`${message.dropped} dropped`);
-  // Only the cap is shown. cost_inr is never read: a live run's is structurally
-  // zero, so a rupee meter beside a real budget would be a lie. The real total
-  // arrives with the transcript, in the file, for a batch run.
-  if (message.cost_cap) summary.push(`cost cap Rs ${message.cost_cap}`);
+  function renderCost(message) {
+  const meter = $("cost");
+  const { cost_inr } = message;
+  const spent = typeof cost_inr === "number" ? `₹${cost_inr.toFixed(2)}` : "";
+  const cap = typeof message.cost_cap === "number" ? `of ₹${message.cost_cap.toFixed(0)}` : "";
+  meter.textContent = spent || cap ? `${spent} ${cap}`.trim() : "";
+  meter.hidden = meter.textContent === "";
+}
+
+function renderState(message) {
+  $("status").textContent = RUN_STATE[message.status] || message.status;
+  $("status").dataset.status = message.status;
+  $("start").disabled = BUSY.has(message.status);
+  $("stop").disabled = !canStop(message);
+
+  const summary = [
+    fmtTime(message.elapsed_s),
+    `${message.segments} segment${message.segments === 1 ? "" : "s"}`,
+  ];
+  if (message.dropped) summary.push(`${message.dropped} dropped`);
+  renderCost(message);
   $("summary").textContent = summary.join(" · ");
 
   if (message.error) logLine(message.error, "error");
@@ -495,6 +512,10 @@ function renderEnd(message) {
     button.onclick = () => recover(message.session_dir);
     panel.appendChild(button);
   }
+}
+
+function renderSegment(message) {
+  addRow(message);
 }
 
 function render(message) {

@@ -247,6 +247,35 @@ def test_stop_is_offered_only_for_a_run_that_can_stop():
     assert 'onclick = stop' in js
 
 
+def test_the_page_renders_a_running_cost_and_a_cap():
+    js = _read("app.js")
+    assert "cost_inr" in js
+    assert "cost_cap" in js
+
+
+def test_the_cost_meter_shows_no_per_row_cost():
+    """`segment` messages carry no cost. Rendering one per row would invent it."""
+    js = _read("app.js")
+    render_segment = _function(js, "renderSegment")
+    assert "cost_inr" not in render_segment
+
+
+def test_the_meter_says_unavailable_rather_than_zero_before_the_first_report():
+    """`cost_cap` is None, not 0.0, until a run sets it — showing ₹0 there
+    would read as a budget that is already spent."""
+    js = _read("app.js")
+    assert "cost_cap" in js
+    render_state = _function(js, "renderState")
+    assert "renderCost" in render_state, "the meter must hang off renderState"
+
+
+def test_a_missing_cost_field_leaves_the_meter_blank_rather_than_zero():
+    """An older server, or a state that predates the field, must not read ₹0."""
+    js = _read("app.js")
+    meter = _function(js, "renderCost")
+    assert "typeof" in meter, "a missing field must be detected, not assumed zero"
+
+
 def test_no_live_cost_meter_is_built_from_the_always_zero_field():
     """state.cost_inr and segment.cost_inr are 0.0 for every live run.
 
