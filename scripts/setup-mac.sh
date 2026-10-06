@@ -65,6 +65,22 @@ FLAG_REPO_URL=""
 FLAG_BRANCH=""
 REPO_URL_SET=0
 BRANCH_SET=0
+# Explicit flags for this run. Empty means "not given", which is what lets the
+# saved config win; *_SET distinguishes "given as empty" from "not given".
+# These six *_SET lines must stay ABOVE the parse loop below — declared after it,
+# they would reset what the parser just set and every flag would be discarded.
+FLAG_EXTRAS=""
+FLAG_KEYS=""
+FLAG_LIVE_SETUP=""
+FLAG_ROUTE_OUTPUT=""
+FLAG_PREFETCH=""
+FLAG_RUN_TESTS=""
+EXTRAS_SET=0
+KEYS_SET=0
+LIVE_SETUP_SET=0
+ROUTE_OUTPUT_SET=0
+PREFETCH_SET=0
+RUN_TESTS_SET=0
 ASSUME_YES=0
 DRY_RUN=0
 RESET=0
@@ -204,20 +220,6 @@ LIVE_SETUP="no"
 ROUTE_OUTPUT="no"
 PREFETCH="yes"
 RUN_TESTS="yes"
-# Explicit flags for this run. Empty means "not given", which is what lets the
-# saved config win; *_SET distinguishes "given as empty" from "not given".
-FLAG_EXTRAS=""
-FLAG_KEYS=""
-FLAG_LIVE_SETUP=""
-FLAG_ROUTE_OUTPUT=""
-FLAG_PREFETCH=""
-FLAG_RUN_TESTS=""
-EXTRAS_SET=0
-KEYS_SET=0
-LIVE_SETUP_SET=0
-ROUTE_OUTPUT_SET=0
-PREFETCH_SET=0
-RUN_TESTS_SET=0
 
 # Parsed with a whitelist loop rather than `source`: this file is read by a
 # script that runs sudo, so it must never become a chance to execute code.
