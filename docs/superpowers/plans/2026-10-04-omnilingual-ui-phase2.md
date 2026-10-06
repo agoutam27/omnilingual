@@ -350,22 +350,31 @@ with a docstring line beside the existing `on_segment` docs:
     same reason as ``on_segment`` — a consumer's bug must not end a meeting.
 ```
 
-Then, immediately after the existing `state["accrued"] += delta` line:
+Then **after the whole `if keep:` block** — that is, after `state["accrued"] += delta` *and* its trailing `state["bad"] = True` line, dedented back out to the appender's own level:
 
 ```python
-        notify_cost = on_cost or _ignore_cost
-        notify_cost(delta, state["accrued"])
+            if on_cost is not None:
+                # After the total is folded in, so `accrued` is never stale, and
+                # outside `if keep` so a dropped silence still reports 0.0 instead
+                # of leaving the page's running total looking frozen. Reading
+                # `accrued` without `mlock` is safe: this appender thread is its
+                # only writer, and the read happens on that same thread.
+                try:
+                    on_cost(delta, state["accrued"])
+                except Exception:  # noqa: BLE001 - a UI bug must not end the run
+                    log.exception("on_cost callback failed")
 ```
 
-wrapped in the same `try/except Exception: log.exception(...)` the `on_segment` call uses, so one broken consumer cannot end the run.
+Two placement facts, both verified against `live.py:464-473`, and together they are why this must go **outside** `if keep:`:
 
-Add the no-op next to the module's other helpers:
+- `state["accrued"] += delta` is itself inside `if keep:` (line 468). Firing from inside that block would mean a dropped silence **never** fires the callback at all.
+- Firing before the block instead would pass a **stale** `accrued` for every kept segment — the total would lag by one segment.
 
-```python
-def _ignore_cost(delta: float, accrued: float) -> None:
-    """Stand-in for an absent on_cost, bound once so the hot path never
-    re-tests the parameter."""
-```
+Wrapped in the same `try/except Exception: log.exception(...)` the `on_segment` call uses, so one broken consumer cannot end the run. This mirrors `on_segment`'s placement (also outside `if keep:`), which is what makes the page learn about every sealed chunk.
+
+Note that a cost-cap halt emits its halt segment with `status == "stt_failed"`, so the `no_speech` drop branch does not apply, `keep` stays `True`, and `delta` is `0.0` — `on_cost(0.0, final_total)` therefore fires when the run halts, which is exactly when the page most needs the real total.
+
+No helper function is needed. Use the same `if on_cost is not None:` guard the shipped `on_segment` call uses at `live.py:454` — do **not** introduce a bound `_ignore_cost` stand-in, since that would be a second pattern for one idea in a module that already has one.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
