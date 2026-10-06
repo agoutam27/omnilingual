@@ -1271,3 +1271,39 @@ def test_a_live_run_reports_a_real_running_cost(respx_mock, tmp_path):
     assert any(value > 0 for value in spent), (
         f"no state message carried a non-zero cost_inr: {spent}"
     )
+
+
+@respx.mock
+def test_a_live_run_reports_cost_with_dropped_chunk(respx_mock, tmp_path):
+    """Verify cost accumulation includes dropped-but-billed chunks, not just kept ones.
+
+    The middle chunk "   " returns whitespace-only text -> billed by the provider
+    but dropped from the file (no_speech). _on_cost accumulates delta from every
+    sealed chunk via `self._cost += delta`, so the final cost_inr reflects ALL 3
+    billed chunks even though the middle one is absent from the transcript file.
+    If _on_cost instead adopted `accrued` (the pipeline cap that only adds delta
+    when keep=True), the dropped chunk's non-zero delta would be omitted and the
+    final cost would under-report spend.
+    """
+    _route(respx_mock, texts=("Bravo", "   ", "Vanakkam"))
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    config, stt, mt = _providers()
+    runner, queue, opts, factory = _live(tmp_path, factory)
+
+    runner.start_live(settings=config, stt=stt, translator=mt, diarizer=None,
+                      opts=opts, capture_factory=factory)
+    runner.join(timeout=120)
+
+    # All 3 chunks must be observed as segments (including the dropped silence)
+    segments = queue.of("segment")
+    assert len(segments) == 3, f"expected 3 segments, got {len(segments)}"
+
+    # Cost must reflect all 3 billed chunks, including the dropped-but-billed
+    # middle chunk. _on_cost accumulates delta from every sealed chunk via
+    # `self._cost += delta`; if it adopted `accrued` (pipeline cap that only
+    # adds delta when keep=True), the middle chunk's delta would be omitted.
+    spent = [m["cost_inr"] for m in queue.of("state") if "cost_inr" in m]
+    assert any(value > 0 for value in spent), (
+        f"no state message carried a non-zero cost_inr: {spent}"
+    )
