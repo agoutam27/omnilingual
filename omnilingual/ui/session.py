@@ -243,7 +243,7 @@ def _numeric(values: Mapping[str, object], field: str, default,
         raise ConfigError(
             f"--{field.replace('_', '-')} must be {kind} (got {raw!r})"
         ) from exc
-    if not math.isfinite(number):
+    if isinstance(number, float) and not math.isfinite(number):
         # float("1e400") succeeds and yields inf, so the except clause cannot
         # catch this one. It has to be refused here or it reaches snapshot()'s
         # cost_cap, where Starlette's send_json writes a bare Infinity token that

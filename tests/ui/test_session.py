@@ -1190,6 +1190,38 @@ def test_a_non_finite_cost_cap_is_a_configerror(bad, tmp_path):
         live_options({"max_cost": bad}, out=tmp_path / "x.md")
 
 
+def test_a_huge_integer_for_num_speakers_does_not_overflow(tmp_path, monkeypatch):
+    """A >=309-digit integer for num_speakers (as_int=True) must not escape as
+    a 500 via OverflowError. int(10**400) succeeds as a Python bigint, and with
+    the fix math.isfinite is only called on floats, so the value is accepted
+    mathematically finite — the OverflowError that previously escaped is gone."""
+    _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SARVAM_API_KEY", "k")
+    panel = {"mode": "live", "stt": "sarvam", "mt": "mayura", "langs": []}
+    panel["num_speakers"] = int("1" + "0" * 400)
+    # The fix: OverflowError must not escape; the value is accepted as a valid int.
+    # Before the fix this raised OverflowError outside the try block.
+    settings, *_ = build_run(panel)
+    assert settings.num_speakers == panel["num_speakers"]
+
+
+def test_as_int_with_inf_still_raises_configerror(tmp_path, monkeypatch):
+    """1e400 as a float yields inf; int(inf) raises OverflowError, which is caught
+    by the except clause — ConfigError must still be raised, not a 500."""
+    _empty_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SARVAM_API_KEY", "k")
+    panel = {"mode": "live", "stt": "sarvam", "mt": "mayura", "langs": []}
+    panel["num_speakers"] = 1e400  # float('inf')
+    with pytest.raises(ConfigError, match="num-speakers"):
+        build_run(panel)
+
+
+def test_max_cost_inf_still_raises_configerror(tmp_path):
+    """float('inf') for max_cost must still be rejected by the isfinite check."""
+    with pytest.raises(ConfigError, match="max-cost"):
+        live_options({"max_cost": float("inf")}, out=tmp_path / "x.md")
+
+
 @pytest.mark.parametrize("blank", [None, "", "   "])
 def test_a_cleared_numeric_field_falls_back_to_its_default(blank, tmp_path, monkeypatch):
     """Absent, null and blank all mean "not provided". Rejecting them would fail
