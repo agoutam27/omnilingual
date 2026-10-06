@@ -24,6 +24,19 @@
 #   --dry-run          Print the resolved plan and the detected diff, then exit
 #                      without touching anything.
 #   --reset            Forget saved answers and re-ask from the defaults.
+#   --extras <list>    Comma-separated extras to enable, from:
+#                      local-stt (offline speech-to-text), diarize (speaker
+#                      labels), local-mt (offline translation), ui (the local
+#                      app). Overrides the saved answers for this run.
+#   --keys <list>      Comma-separated API keys to prompt for and store in .env,
+#                      from: SARVAM_API_KEY, GROQ_API_KEY, GEMINI_API_KEY.
+#   --live-setup <yn>  Create the BlackHole capture devices. Default: no.
+#   --route-output <yn> Switch system output to the Multi-Output Device. Only
+#                      meaningful with --live-setup yes; forced to no without it.
+#   --prefetch <yn>    Pre-download model weights. Default: yes.
+#   --run-tests <yn>   Run the test suite at the end. Default: yes.
+#   Each of these overrides the saved answers for this run and the resolved
+#   value is written back, so re-running converges instead of re-asking.
 #   -h, --help         Show this help.
 #
 # Saved answers live in ${XDG_CONFIG_HOME:-~/.config}/omnilingual/setup-mac.conf,
@@ -64,6 +77,12 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo)   [[ $# -ge 2 ]] || { echo "--repo needs a value" >&2; exit 2; }; FLAG_REPO_URL="$2"; REPO_URL_SET=1; shift 2 ;;
         --branch) [[ $# -ge 2 ]] || { echo "--branch needs a value" >&2; exit 2; }; FLAG_BRANCH="$2"; BRANCH_SET=1; shift 2 ;;
+        --extras)       [[ $# -ge 2 ]] || { echo "--extras needs a value" >&2; exit 2; }; FLAG_EXTRAS="$2"; EXTRAS_SET=1; shift 2 ;;
+        --keys)         [[ $# -ge 2 ]] || { echo "--keys needs a value" >&2; exit 2; }; FLAG_KEYS="$2"; KEYS_SET=1; shift 2 ;;
+        --live-setup)   [[ $# -ge 2 ]] || { echo "--live-setup needs a value" >&2; exit 2; }; FLAG_LIVE_SETUP="$2"; LIVE_SETUP_SET=1; shift 2 ;;
+        --route-output) [[ $# -ge 2 ]] || { echo "--route-output needs a value" >&2; exit 2; }; FLAG_ROUTE_OUTPUT="$2"; ROUTE_OUTPUT_SET=1; shift 2 ;;
+        --prefetch)     [[ $# -ge 2 ]] || { echo "--prefetch needs a value" >&2; exit 2; }; FLAG_PREFETCH="$2"; PREFETCH_SET=1; shift 2 ;;
+        --run-tests)    [[ $# -ge 2 ]] || { echo "--run-tests needs a value" >&2; exit 2; }; FLAG_RUN_TESTS="$2"; RUN_TESTS_SET=1; shift 2 ;;
         -y|--yes)   ASSUME_YES=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --reset)   RESET=1; shift ;;
@@ -185,6 +204,20 @@ LIVE_SETUP="no"
 ROUTE_OUTPUT="no"
 PREFETCH="yes"
 RUN_TESTS="yes"
+# Explicit flags for this run. Empty means "not given", which is what lets the
+# saved config win; *_SET distinguishes "given as empty" from "not given".
+FLAG_EXTRAS=""
+FLAG_KEYS=""
+FLAG_LIVE_SETUP=""
+FLAG_ROUTE_OUTPUT=""
+FLAG_PREFETCH=""
+FLAG_RUN_TESTS=""
+EXTRAS_SET=0
+KEYS_SET=0
+LIVE_SETUP_SET=0
+ROUTE_OUTPUT_SET=0
+PREFETCH_SET=0
+RUN_TESTS_SET=0
 
 # Parsed with a whitelist loop rather than `source`: this file is read by a
 # script that runs sudo, so it must never become a chance to execute code.
@@ -237,6 +270,12 @@ fi
 # An explicit flag on this run outranks whatever was saved last time.
 if [[ $REPO_URL_SET -eq 1 ]]; then REPO_URL="$FLAG_REPO_URL"; fi
 if [[ $BRANCH_SET -eq 1 ]]; then BRANCH="$FLAG_BRANCH"; fi
+if [[ $EXTRAS_SET -eq 1 ]]; then EXTRAS="$FLAG_EXTRAS"; fi
+if [[ $KEYS_SET -eq 1 ]]; then KEYS="$FLAG_KEYS"; fi
+if [[ $LIVE_SETUP_SET -eq 1 ]]; then LIVE_SETUP="$FLAG_LIVE_SETUP"; fi
+if [[ $ROUTE_OUTPUT_SET -eq 1 ]]; then ROUTE_OUTPUT="$FLAG_ROUTE_OUTPUT"; fi
+if [[ $PREFETCH_SET -eq 1 ]]; then PREFETCH="$FLAG_PREFETCH"; fi
+if [[ $RUN_TESTS_SET -eq 1 ]]; then RUN_TESTS="$FLAG_RUN_TESTS"; fi
 
 EXTRAS="$(sanitize "$ALL_EXTRAS" "$EXTRAS")"
 KEYS="$(sanitize "$ALL_KEYS" "$KEYS")"
