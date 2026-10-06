@@ -1252,3 +1252,22 @@ def test_num_speakers_absent_still_means_auto_count(tmp_path, monkeypatch):
     with pytest.raises(ConfigError):
         build_run({"mode": "recording", "stt": "sarvam", "mt": "mayura",
                    "langs": [], "num_speakers": 1})
+
+
+@respx.mock
+def test_a_live_run_reports_a_real_running_cost(respx_mock, tmp_path):
+    """`state.cost_inr` must be the run's actual spend, not a structural zero."""
+    _route(respx_mock)
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    config, stt, mt = _providers()
+    runner, queue, opts, factory = _live(tmp_path, factory)
+
+    runner.start_live(settings=config, stt=stt, translator=mt, diarizer=None,
+                      opts=opts, capture_factory=factory)
+    runner.join(timeout=120)
+
+    spent = [m["cost_inr"] for m in queue.of("state") if "cost_inr" in m]
+    assert any(value > 0 for value in spent), (
+        f"no state message carried a non-zero cost_inr: {spent}"
+    )

@@ -517,7 +517,8 @@ class SessionRunner:
         try:
             code = run_live(opts, settings, stt, translator, diarizer=diarizer,
                             status=on_status, capture_factory=capture_factory,
-                            on_segment=on_segment, stop_event=self._stop)
+                            on_segment=on_segment, on_cost=self._on_cost,
+                            stop_event=self._stop)
         except BaseException as exc:  # noqa: BLE001 - reported, never raised out
             self._discover_session(root, before)
             self._fail(exc)
@@ -601,20 +602,33 @@ class SessionRunner:
     def _on_segment(self, seg, keep: bool, delta: float) -> None:
         """One sealed chunk, one row.
 
-        `delta` is 0 for both pipeline entry points: run_live's on_segment and the
-        batch progress callback carry no cost, and re-deriving one here would put
-        a second copy of the pipeline's pricing in the UI. The run's real total
-        arrives with the Transcript and lands in the final state.
+        `delta` is no longer the source of truth for cost accumulation — that
+        now belongs to `_on_cost`. This method only tracks segment counts and
+        whether the chunk was kept or dropped.
         """
         with self._lock:
             seq = self._seq
             self._seq += 1
             self._segments += 1
             if keep:
-                self._cost += delta
+                pass
             else:
                 self._dropped += 1
         self._emit(self.segment_message(seq, seg, delta, keep))
+
+    def _on_cost(self, delta: float, accrued: float) -> None:
+        """A live run's running spend, accumulated from every sealed chunk.
+
+        Deliberately NOT `self._cost = accrued`. `accrued` is the pipeline's
+        cap counter, folded in inside the `if keep:` branch, so it omits a
+        chunk that was billed but then dropped from the file — a provider that
+        answered with whitespace. Adopting it would under-report what the user
+        actually paid, and a silently dropped charge is the worst failure a
+        money display can have. `accrued` is accepted and ignored; `delta` is
+        the truth, and summing it over every sealed chunk is the real bill.
+        """
+        with self._lock:
+            self._cost += delta
 
     def _fail(self, exc: BaseException) -> None:
         log.exception("session %s failed", self.run_id, exc_info=exc)
