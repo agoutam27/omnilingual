@@ -10,6 +10,7 @@
 <header>
   <h1>omnilingual</h1>
   <div id="banner" class="banner hidden" role="status"></div>
+  <button id="relaunch" type="button" hidden>Restart</button>
 </header>
 
 <main>
@@ -91,6 +92,25 @@
       <legend>Saved sessions</legend>
       <div id="runs"></div>
     </fieldset>
+  </section>
+
+  <section id="setup" hidden>
+    <h2>Setup</h2>
+    <p class="hint">Runs <code>scripts/setup-mac.sh</code> to install or remove the
+    packages and audio devices omnilingual needs. Nothing runs until you press Apply.</p>
+    <div class="row">
+      <label for="setup-extras">Capabilities</label>
+      <input id="setup-extras" type="text" placeholder="local-stt,diarize,ui">
+    </div>
+    <div class="row"><label><input id="setup-live-setup" type="checkbox"> Create the live-capture audio devices</label></div>
+    <div class="row"><label><input id="setup-route-output" type="checkbox"> Switch system audio output to the capture device</label></div>
+    <div class="row"><label><input id="setup-prefetch" type="checkbox" checked> Pre-download model weights</label></div>
+    <div class="row"><label><input id="setup-run-tests" type="checkbox" checked> Run the test suite afterwards</label></div>
+    <div class="row">
+      <button id="setup-preview" type="button">Preview</button>
+      <button id="setup-apply" type="button" class="danger">Apply</button>
+    </div>
+    <pre id="setup-plan" hidden></pre>
   </section>
 </main>
 

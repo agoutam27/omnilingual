@@ -450,3 +450,42 @@ def test_the_page_loads_nothing_from_off_the_machine():
     js = _read("app.js")
     assert "https://" not in js and "http://" not in js
     assert "@import" not in _read("style.css")
+
+
+def test_the_page_has_a_setup_section_with_a_capability_form():
+    html = _read("index.html")
+    assert 'id="setup"' in html
+    for control in ("setup-extras", "setup-live-setup", "setup-route-output",
+                    "setup-prefetch", "setup-run-tests", "setup-preview",
+                    "setup-apply"):
+        assert f'id="{control}"' in html, f"{control} is missing"
+
+
+def test_the_setup_form_sends_exactly_the_accepted_fields():
+    js = _read("app.js")
+    body = _function(js, "capabilityPayload")
+    for field in ("extras", "live_setup", "route_output", "prefetch", "run_tests"):
+        assert field in body
+    assert "keys" not in body, "the Setup screen must never hold a secret"
+
+
+def test_apply_wires_through_the_detached_map_and_re_polls_afterwards():
+    js = _read("app.js")
+    assert '"/api/setup/apply":"setup-apply"' in js
+    apply_fn = _function(js, "applySetup")
+    assert "setup-apply" in apply_fn
+    # A detached apply returns {"started": true}; the page must re-read readiness
+    # when the log goes quiet rather than trusting the POST's response.
+    assert "detached" in apply_fn, "apply must go through the detached map"
+
+
+def test_the_setup_screen_says_a_restart_is_needed_after_apply():
+    js = _read("app.js")
+    assert "Restart to use newly installed components" in js
+    assert "restart" in js.lower()
+
+
+def test_relaunch_is_a_button_not_a_form_post():
+    html = _read("index.html")
+    assert 'id="relaunch"' in html
+    assert "relaunch" in _read("app.js")

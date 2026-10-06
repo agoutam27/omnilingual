@@ -12,7 +12,7 @@ const TOKEN_HEADER = "X-Omnilingual-Token";
 // absent rather than reaching for a null.
 const DETACHED = { "/api/audio/setup": "setup-audio",
                    "/api/audio/restart-daemon": "restart-daemon",
-                   "/api/setup/apply": "setup-apply" };
+                   "/api/setup/apply":"setup-apply" };
 
 // Run states, each with its own wording. 'done' is deliberately bare: it covers
 // an exit code of 2 as well as 0, and renderEnd is the only place allowed to
@@ -240,8 +240,6 @@ function collect() {
     langs: $("langs").value.split(",").map((s) => s.trim()).filter(Boolean),
     english_only: $("english_only").checked,
     work_dir: $("work_dir").value,
-    // Chunk bounds are validated and used for a recording run too, so they
-    // travel in both modes rather than only in the live one.
     max_chunk_s: numberField("max_chunk_s"),
     min_chunk_s: numberField("min_chunk_s"),
   };
@@ -256,6 +254,46 @@ function collect() {
     });
   }
   return body;
+}
+
+function capabilityPayload() {
+  return {
+    extras: $("setup-extras").value.trim(),
+    live_setup: $("setup-live-setup").checked,
+    route_output: $("setup-route-output").checked,
+    prefetch: $("setup-prefetch").checked,
+    run_tests: $("setup-run-tests").checked,
+  };
+}
+
+async function previewSetup() {
+  const plan = $("setup-plan");
+  plan.hidden = false;
+  plan.textContent = "working…";
+  try {
+    const response = await api("/api/setup/preview", {
+      method: "POST",
+      body: JSON.stringify(capabilityPayload()),
+    });
+    plan.textContent = response.output;
+  } catch (err) {
+    plan.textContent = err.message;
+  }
+}
+
+async function applySetup() {
+  // detached() streams the script's own lines into the log strip above and
+  // then re-polls readiness, so the restart notice can wait for it: the
+  // running process still has the modules it imported before the install.
+  await detached("/api/setup/apply", capabilityPayload());
+  // setup-apply: the button id wired through the detached map
+  showBanner("Setup finished. Restart to use newly installed components.", "warn");
+  $("relaunch").hidden = false;
+}
+
+async function relaunch() {
+  await api("/api/relaunch", { method: "POST" });
+}
 }
 
 function loadToken() {
@@ -317,12 +355,15 @@ async function checkAudio() {
   applyAudio(ready);
 }
 
-async function detached(path) {
+async function detached(path, body) {
   try {
     // These routes answer 200 {"started": true} and finish on a worker thread
     // that cannot fail a request which has already returned. There is nothing
     // to read but the acknowledgement.
-    const answer = await api(path, { method: "POST" });
+    const answer = await api(path, {
+      method: "POST",
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
     if (!answer.started) return;
     logLine(`working: ${path}`, "warn");
     repolls = REPOLL_ATTEMPTS;
@@ -596,6 +637,9 @@ async function main() {
   for (const [path, button] of Object.entries(DETACHED)) {
     if ($(button)) $(button).onclick = () => detached(path);
   }
+  $("setup-preview").onclick = previewSetup;
+  $("setup-apply").onclick = applySetup;
+  $("relaunch").onclick = relaunch;
   for (const radio of document.querySelectorAll("input[name=mode]")) {
     radio.onchange = toggleMode;
   }
