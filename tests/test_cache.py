@@ -44,3 +44,28 @@ def test_malformed_json_is_treated_as_miss(tmp_path):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{not json", encoding="utf-8")
     assert cache.get("stt", "broken") is None
+
+
+def test_concurrent_puts_of_one_key_never_raise(tmp_path):
+    """Live workers can translate the same short phrase at once; a shared temp
+    path made the losing writer's replace() raise FileNotFoundError."""
+    import threading
+
+    cache = JsonCache(tmp_path)
+    errors: list[BaseException] = []
+
+    def write() -> None:
+        for _ in range(200):
+            try:
+                cache.put("mt", "same", {"english": "x" * 2000})
+            except BaseException as exc:  # noqa: BLE001 - collected for the assert
+                errors.append(exc)
+
+    threads = [threading.Thread(target=write) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert cache.get("mt", "same") == {"english": "x" * 2000}
+    assert list((tmp_path / "mt").iterdir()) == [tmp_path / "mt" / "same.json"]

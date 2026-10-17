@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -27,9 +29,17 @@ class JsonCache:
     def put(self, namespace: str, key: str, value: dict) -> None:
         p = self._path(namespace, key)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(p)
+        # A temp name unique per writer: live workers can put one key at once (two
+        # chunks saying the same short phrase), and a shared name let the loser's
+        # replace() find its file already moved.
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{key}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(value, ensure_ascii=False, indent=2))
+            os.replace(tmp, p)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
 
 def _sha(*parts: bytes) -> str:
