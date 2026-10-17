@@ -9,6 +9,7 @@ import re
 import shutil
 import wave
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import TypeVar
 
@@ -211,10 +212,19 @@ def _diarize_cached(
     ) or []
 
 
-def _combine_session_wavs(session_dir: Path, chunks: list[Chunk]) -> Path:
+def _combine_session_wavs(session_dir: Path, chunks: list[Chunk]) -> tuple[Path, list[Chunk]]:
     """Concatenate sealed live chunks (all 16 kHz mono s16le) into one audio
-    file so the offline diarizer sees the whole session contiguously."""
+    file so the offline diarizer sees the whole session contiguously.
+
+    Also returns the chunks re-timed onto that file. Live sessions keep only
+    speech chunks, stamped with session-clock times, so every dropped gap makes
+    the concatenation shorter than the session; the diarizer's turns are on the
+    concatenated timeline and must be matched against these spans, not
+    chunk.start_s. Spans come from frames actually written, so they never drift.
+    """
     out = session_dir / "diarize-input.wav"
+    spans: list[Chunk] = []
+    frames = 0
     with wave.open(str(out), "wb") as wout:
         wout.setnchannels(1)
         wout.setsampwidth(2)
@@ -223,8 +233,11 @@ def _combine_session_wavs(session_dir: Path, chunks: list[Chunk]) -> Path:
             with wave.open(str(chunk.wav_path), "rb") as win:
                 if (win.getnchannels(), win.getsampwidth(), win.getframerate()) != (1, 2, 16000):
                     raise ValueError(f"chunk wav has unexpected format: {chunk.wav_path}")
-                wout.writeframes(win.readframes(win.getnframes()))
-    return out
+                n = win.getnframes()
+                wout.writeframes(win.readframes(n))
+            spans.append(replace(chunk, start_s=frames / 16000, end_s=(frames + n) / 16000))
+            frames += n
+    return out, spans
 
 
 def transcribe_chunks(
@@ -340,6 +353,6 @@ def run_from_chunks(
         raise ValueError(f"live session missing {len(missing)} chunk wav(s), e.g. {missing[0]}")
     speakers = None
     if diarizer is not None:
-        combined = _combine_session_wavs(session_dir, chunks)
-        speakers = _speakers_for_chunks(chunks, combined, settings, diarizer, cache)
+        combined, spans = _combine_session_wavs(session_dir, chunks)
+        speakers = _speakers_for_chunks(spans, combined, settings, diarizer, cache)
     return transcribe_chunks(chunks, chunks[-1].end_s, Path(session_dir.name), settings, stt, translator, cache, progress, speakers=speakers)

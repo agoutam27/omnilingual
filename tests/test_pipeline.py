@@ -424,3 +424,27 @@ def test_run_from_chunks_diarizes_combined_audio(tmp_path: Path, settings):
     assert dz.calls == 1
     assert dz.paths[0].name == "diarize-input.wav"
     assert [s.speaker for s in t.segments] == ["Speaker 1", "Speaker 1"]
+
+
+def test_run_from_chunks_maps_turns_across_dropped_gaps(tmp_path: Path, settings):
+    """Live chunks keep session-clock times but the gaps between them are not on
+    disk, so diarize-input.wav is shorter than the session. Turns come back on
+    that concatenated timeline and must be matched there, not on session time."""
+    session = tmp_path / "live-1"
+    (session / "live-chunks").mkdir(parents=True)
+    chunks = []
+    for i, start in enumerate((0.0, 20.0, 40.0)):
+        wav = session / "live-chunks" / f"{i:04d}.wav"
+        make_wav(wav, [("tone", 5.0)])
+        chunks.append(Chunk(i, start, start + 5.0, wav.resolve()))
+    (session / "chunks.json").write_text(chunks_to_json(chunks), encoding="utf-8")
+    (session / "session.json").write_text(json.dumps({"kind": LIVE_SESSION_KIND}), encoding="utf-8")
+    # Concatenated: chunk 0 = 0-5 s, chunk 1 = 5-10 s, chunk 2 = 10-15 s.
+    dz = FakeDiarizer([Turn(0.0, 5.0, "a"), Turn(5.0, 10.0, "b"), Turn(10.0, 15.0, "a")])
+    t = run_from_chunks(
+        session, settings,
+        FakeSTT([STTResult("hi-IN", 0.9, w) for w in ("एक", "दो", "तीन")]),
+        FakeMT(), JsonCache(session / "cache"), diarizer=dz,
+    )
+    assert [s.speaker for s in t.segments] == ["Speaker 1", "Speaker 2", "Speaker 1"]
+    assert [s.chunk.start_s for s in t.segments] == [0.0, 20.0, 40.0]
