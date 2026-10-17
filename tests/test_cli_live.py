@@ -281,3 +281,58 @@ def test_transcribe_from_chunks_rejects_bad_dir(live_cli):
     res = runner.invoke(app, ["transcribe", "--from-chunks", str(live_cli)])
     assert res.exit_code == 1
     assert "live-session" in res.output
+
+
+def test_transcribe_from_chunks_honours_diarize_and_langs(live_cli, monkeypatch):
+    """--diarize alone selects sherpa on the file path; recovery must agree."""
+    session = _session_dir(live_cli, n=1)
+    seen = {}
+
+    def fake_run_from_chunks(session_dir, settings, stt, translator, cache,
+                             progress=None, diarizer=None):
+        seen["settings"], seen["diarizer"] = settings, diarizer
+        from omnilingual.models import Transcript
+
+        return Transcript(source=session_dir, duration_s=0.0)
+
+    monkeypatch.setattr(cli_mod, "build_diarizer", lambda settings: "DZ")
+    monkeypatch.setattr(cli_mod, "run_from_chunks", fake_run_from_chunks)
+    res = runner.invoke(app, ["transcribe", "--from-chunks", str(session),
+                              "--api-key", "k", "--diarize", "--langs", "hi-IN"])
+    assert res.exit_code == 0, res.output
+    assert seen["diarizer"] == "DZ"
+    assert seen["settings"].diarizer == "sherpa"
+    assert seen["settings"].langs == ("hi-IN",)
+
+
+@pytest.mark.parametrize("exc, hint", [
+    ("quota", "re-run"),
+    ("auth", "API key"),
+    ("missing", "chunk wav"),
+])
+def test_transcribe_from_chunks_reports_errors_without_traceback(live_cli, monkeypatch, exc, hint):
+    from omnilingual.http import AuthError, QuotaError
+
+    session = _session_dir(live_cli, n=1)
+    errors = {
+        "quota": QuotaError("credits exhausted (402)", 402),
+        "auth": AuthError("authentication failed (401)", 401),
+        "missing": ValueError("live session missing 1 chunk wav(s)"),
+    }
+
+    def boom(*a, **k):
+        raise errors[exc]
+
+    monkeypatch.setattr(cli_mod, "run_from_chunks", boom)
+    res = runner.invoke(app, ["transcribe", "--from-chunks", str(session), "--api-key", "k"])
+    assert res.exit_code == 1, res.output
+    assert not isinstance(res.exception, (QuotaError, AuthError, ValueError))
+    assert hint in res.output
+
+
+def test_bare_from_chunks_routes_to_transcribe(live_cli):
+    session = _session_dir(live_cli, n=1)
+    res = runner.invoke(app, ["--from-chunks", str(session), "--api-key", "k",
+                              "--out", str(live_cli / "r.md")])
+    assert res.exit_code == 0, res.output
+    assert (live_cli / "r.md").exists()

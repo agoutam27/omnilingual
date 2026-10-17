@@ -29,7 +29,7 @@ class MlxWhisperSTT:
             if importlib.util.find_spec("mlx_whisper") is None:
                 raise ConfigError(
                     "mlx-whisper STT needs the local extra: "
-                    "uv pip install 'omnilingual[local-stt]'"
+                    "uv sync --extra local-stt  # or: uv pip install 'omnilingual[local-stt]'"
                 )
             decode = _MlxEngine(settings.resolved_stt_model)
         self._decode = decode

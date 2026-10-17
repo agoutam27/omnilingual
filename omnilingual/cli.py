@@ -49,9 +49,11 @@ class _AppGroup(typer.core.TyperGroup):
     """
 
     def parse_args(self, ctx, args):
+        # The group has no options of its own besides --help, so a leading flag
+        # (`omnilingual --stt groq rec.m4a`, `omnilingual --from-chunks DIR`)
+        # can only belong to transcribe.
         if args and args[0] not in self.commands and args[0] not in ("-h", "--help"):
-            if not args[0].startswith("-"):
-                args = ["transcribe", *args]
+            args = ["transcribe", *args]
         return super().parse_args(ctx, args)
 
 
@@ -92,7 +94,8 @@ def _run_from_chunks(session_dir: Path, *, out: Path | None,
                      api_key: str | None, work_dir: Path | None,
                      stt_provider: str, stt_model: str | None,
                      mt_provider: str, mt_model: str | None,
-                     diarizer: str | None, num_speakers: int | None) -> None:
+                     diarizer: str | None, num_speakers: int | None,
+                     langs: Sequence[str] = ()) -> None:
     """Finish a halted live session. Never returns (raises typer.Exit)."""
     if work_dir is not None:
         _fail("--work-dir has no effect with --from-chunks (the session cache is reused)")
@@ -108,7 +111,8 @@ def _run_from_chunks(session_dir: Path, *, out: Path | None,
         _fail(f"{session_dir} is not a live-session dir ({exc})")
     assert chunks  # narrowed by the guard above
     try:
-        settings = load_settings(api_key=api_key, stt_provider=stt_provider, stt_model=stt_model,
+        settings = load_settings(api_key=api_key, langs=langs,
+                                 stt_provider=stt_provider, stt_model=stt_model,
                                  mt_provider=mt_provider, mt_model=mt_model,
                                  diarizer=diarizer, num_speakers=num_speakers)
         stt = build_stt(settings)
@@ -134,10 +138,19 @@ def _run_from_chunks(session_dir: Path, *, out: Path | None,
         # external value; the counter and the mark are ours.
         console.print(f"\\[{i}/{n}] {fmt_ts(seg.chunk.start_s)} {escape(seg.lang)} {seg.prob:.2f}{mark}")
 
-    transcript = run_from_chunks(session_dir, settings, stt,
-                                 translator,
-                                 JsonCache(session_dir / "cache"), progress,
-                                 diarizer=dz)
+    # Same handling as the file path: these are expected outcomes of a recovery
+    # run (credits out mid-way, a chunk wav deleted by hand), not crashes.
+    try:
+        transcript = run_from_chunks(session_dir, settings, stt,
+                                     translator,
+                                     JsonCache(session_dir / "cache"), progress,
+                                     diarizer=dz)
+    except QuotaError as exc:
+        _fail(f"{exc}. Cached progress kept; re-run same command to resume.")
+    except AuthError as exc:
+        _fail(f"{exc}. Check your API key.")
+    except (SarvamError, ValueError) as exc:
+        _fail(str(exc))
     out_path.write_text(render(transcript), encoding="utf-8")
     console.print(f"Wrote {escape(str(out_path))}")
     if english_only:
@@ -298,16 +311,17 @@ def transcribe(
         stt_provider, stt_model = picks.stt_provider, picks.stt_model
         mt_provider, mt_model = picks.mt_provider, picks.mt_model
         diarize, diarizer, num_speakers = picks.diarize, picks.diarizer, picks.num_speakers
+    lang_list = [s.strip() for s in langs.split(",") if s.strip()] if langs else []
     if from_chunks is not None:
         _run_from_chunks(from_chunks, out=out, english_only=english_only,
                           estimate_only=estimate_only, api_key=api_key, work_dir=work_dir,
                           stt_provider=stt_provider, stt_model=stt_model,
                           mt_provider=mt_provider, mt_model=mt_model,
-                          diarizer=diarizer, num_speakers=num_speakers)
+                          diarizer=diarizer or ("sherpa" if diarize else None),
+                          num_speakers=num_speakers, langs=lang_list)
 
     out_path = out or recording.with_suffix(".md")
     work_root = work_dir or out_path.parent / ".omnilingual"
-    lang_list = [s.strip() for s in langs.split(",") if s.strip()] if langs else []
     try:
         settings = load_settings(api_key=api_key, langs=lang_list, max_chunk_s=max_chunk_s,
                                  min_chunk_s=min_chunk_s, stt_provider=stt_provider, stt_model=stt_model,
@@ -410,7 +424,7 @@ def live(
     diarizer: Annotated[str | None, typer.Option("--diarizer", help="Speaker diarization backend: sherpa (local, free). Omit to disable.")] = None,
     num_speakers: Annotated[int | None, typer.Option("--speakers", "--num-speakers", help="Expected speaker count; omit for auto-count.")] = None,
     work_dir: Annotated[Path | None, typer.Option("--work-dir")] = None,
-    verbose: Annotated[bool, typer.Option("-v")] = False,
+    verbose: Annotated[bool, typer.Option("-v", "--verbose")] = False,
 ):
     """Transcribe mic + system audio live into a growing Markdown file."""
     err = Console(stderr=True)

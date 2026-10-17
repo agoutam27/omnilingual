@@ -321,3 +321,15 @@ def test_no_diarize_flag_means_no_diarizer(rec, patched):
     assert result.exit_code == 0, result.output
     assert patched["settings"].diarizer is None
     assert patched["diarizer"] is None
+
+
+def test_options_before_the_recording_still_route_to_transcribe(rec, patched):
+    result = runner.invoke(cli.app, ["--api-key", "k", str(rec)])
+    assert result.exit_code == 0, result.output
+    assert rec.with_suffix(".md").exists()
+
+
+def test_help_and_subcommands_are_not_rerouted():
+    assert runner.invoke(cli.app, ["--help"]).exit_code == 0
+    assert "transcribe" in runner.invoke(cli.app, ["--help"]).output
+    assert runner.invoke(cli.app, ["live", "--help"]).exit_code == 0
