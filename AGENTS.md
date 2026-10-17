@@ -10,8 +10,8 @@ uv run omnilingual live --out live.md [--ask]            # needs "Omnilingual" a
 uv run omnilingual --from-chunks .omnilingual/live-<ts>  # finish/recover a halted live session
 uv run omnilingual-ui [--no-window]                      # FastAPI on loopback + pywebview window
 uv run pytest -q                                          # ~570 tests, mocked HTTP; real-model suites opt-in:
-#   --run-live (Sarvam, costs paise) --run-mlx --run-faster-whisper --run-diarize
-./scripts/setup-mac.sh [--dry-run]                       # idempotent machine setup: extras, .env keys, BlackHole devices
+#   --run-live (Sarvam, costs paise) --run-mlx --run-faster-whisper --run-indic-transcribe --run-diarize
+./scripts/setup-mac.sh [--check|--dry-run]               # idempotent machine setup + host due-diligence (RAM/disk/network/HF access); --check changes nothing
 ```
 Keys (only for selected backends): `SARVAM_API_KEY` (sarvam/mayura), `GROQ_API_KEY`, `GEMINI_API_KEY`. CLI reads process env only (`uv run --env-file .env …`); UI reads repo `.env` itself. Exit codes: 0 ok, 2 written with failed segments, 1 fatal.
 
@@ -33,7 +33,7 @@ Keys (only for selected backends): `SARVAM_API_KEY` (sarvam/mayura), `GROQ_API_K
 - Pricing: provider may expose `inr_per_hour` / `inr_per_10k_chars` (read via `getattr`); free backends set `0.0`.
 - Optional extras are imported lazily inside factories/constructors; CLI must never import `omnilingual.ui` (test-enforced) so core install stays web-free.
 - Validation (chunk bounds, keys, speakers) lives in `config.py` and is shared by CLI and UI — never duplicate it.
-- UI security: loopback-only bind, launch token + Host/Origin checks; API key values never leave `ui/secrets.py`, never go in argv/logs/events; in UI runs `.env` overrides process env. `secrets.py` mirrors `setup-mac.sh` `.env` semantics — change both together. UI prefs: `~/.config/omnilingual/ui.toml`.
+- UI security: loopback-only bind, launch token + Host/Origin checks; API key values never leave `ui/secrets.py`, never go in argv/logs/events; in UI runs `.env` overrides process env. `secrets.py` mirrors `setup-mac.sh` `.env` semantics — change both together. Extras live in three places that a test keeps equal: `pyproject.toml`, `setup-mac.sh` `ALL_EXTRAS`, `ui/server.py` `_SETUP_EXTRAS`. UI builds providers off the event loop (local providers load their model in `build_stt`). UI prefs: `~/.config/omnilingual/ui.toml`.
 - Live: nothing may kill a worker or callback (`on_segment`, `on_cost`) — an escaped exception leaves the ordered appender waiting forever; log it and mark the chunk failed. `--max-cost` caps true spend (`spent`); `accrued` = kept chunks only, so display spend by summing `delta`.
 - `run_from_chunks` diarizes the concatenated speech chunks (gaps dropped): match turns against the re-timed spans from `_combine_session_wavs`, never session-clock `chunk.start_s`.
 - `pyproject.toml` pins with comments (`sherpa-onnx-core` explicit, `onnxruntime<1.24` on Intel Mac) are deliberate; keep them.

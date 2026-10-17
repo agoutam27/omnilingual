@@ -979,6 +979,49 @@ def test_start_rejects_a_cleared_numeric_field_by_using_the_default(fake_runs, e
     assert opts.max_chunk_s == 28.0
 
 
+def test_start_builds_providers_off_the_event_loop(fake_runs, env, monkeypatch):
+    """A local provider loads (and on first use downloads) its model while it is
+    built; on the loop that would freeze the health check and the WebSocket."""
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    real = server.build_run
+    seen = []
+
+    def build(body):
+        try:
+            asyncio.get_running_loop()
+            seen.append("on the loop")
+        except RuntimeError:
+            seen.append("off the loop")
+        return real(body)
+
+    monkeypatch.setattr(server, "build_run", build)
+    client, token = fake_runs
+    assert client.post("/api/session/start", headers=_ok(token),
+                       json=_start_body()).status_code == 200
+    assert seen == ["off the loop"]
+
+
+def test_a_start_that_loses_the_race_during_the_build_is_refused(fake_runs, env, monkeypatch):
+    """The build now awaits, so a second start can win while the first builds."""
+    env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    real = server.build_run
+    client, token = fake_runs
+
+    def build(body):
+        rival = FakeRunner(run_id="rival", queue=_state(client).queue)
+        _state(client).runs["rival"] = rival
+        return real(body)
+
+    monkeypatch.setattr(server, "build_run", build)
+    res = client.post("/api/session/start", headers=_ok(token), json=_start_body())
+    assert res.status_code == 409
+    assert list(_state(client).runs) == ["rival"]
+
+
+def test_setup_accepts_the_indic_stt_extra():
+    assert server._capability_flags({"extras": "indic-stt,ui"})[:2] == ["--extras", "indic-stt,ui"]
+
+
 def test_start_rejects_an_unknown_panel_field(api, env):
     """One shared allowlist: a field the panel does not own is a bad request."""
     env.write_text(f"SARVAM_API_KEY={FAKE_KEY}\n", encoding="utf-8")
@@ -1062,6 +1105,7 @@ def _hide_extra(monkeypatch, package):
 # turn into a button, so the contract is the status code and not the wording.
 @pytest.mark.parametrize(("package", "panel"), [
     ("mlx_whisper", {"stt": "mlx-whisper"}),
+    ("torch", {"stt": "indic-transcribe"}),
     ("ctranslate2", {"mt": "indictrans2"}),
     ("sherpa_onnx", {"diarize": True}),
 ])

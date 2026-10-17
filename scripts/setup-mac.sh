@@ -25,9 +25,10 @@
 #                      without touching anything.
 #   --reset            Forget saved answers and re-ask from the defaults.
 #   --extras <list>    Comma-separated extras to enable, from:
-#                      local-stt (offline speech-to-text), diarize (speaker
-#                      labels), local-mt (offline translation), ui (the local
-#                      app). Overrides the saved answers for this run.
+#                      local-stt (offline speech-to-text), indic-stt (Indic-
+#                      Transcribe-core: Apple Silicon, gated model), diarize
+#                      (speaker labels), local-mt (offline translation), ui (the
+#                      local app). Overrides the saved answers for this run.
 #   --keys <list>      Comma-separated API keys to prompt for and store in .env,
 #                      from: SARVAM_API_KEY, GROQ_API_KEY, GEMINI_API_KEY.
 #   --live-setup <yn>  Create the BlackHole capture devices. Default: no.
@@ -37,7 +38,17 @@
 #   --run-tests <yn>   Run the test suite at the end. Default: yes.
 #   Each of these overrides the saved answers for this run and the resolved
 #   value is written back, so re-running converges instead of re-asking.
+#   --check            Host due-diligence only: report whether this machine can run
+#                      the selected extras (OS, CPU, RAM, disk, network, Hugging
+#                      Face access), change nothing, exit 1 if anything blocks.
+#   --skip-checks      Run the host check but do not stop on blocking problems.
 #   -h, --help         Show this help.
+#
+# Before changing anything the script checks the host (macOS version, Apple
+# Silicon vs Intel, Rosetta, RAM, free disk against what the selected extras
+# need, network reachability, Hugging Face licence/token for gated models) and
+# stops with a reason if the selection cannot work here. Pick what suits the
+# machine with --extras; the prompt marks which extras this Mac can run.
 #
 # Saved answers live in ${XDG_CONFIG_HOME:-~/.config}/omnilingual/setup-mac.conf,
 # outside the repo so a re-clone cannot lose them. That file records which
@@ -84,6 +95,11 @@ RUN_TESTS_SET=0
 ASSUME_YES=0
 DRY_RUN=0
 RESET=0
+CHECK_ONLY=0
+SKIP_CHECKS=0
+# Test/CI escape hatch: lets a suite run the script without the answer depending on
+# the free disk or network of whoever runs it.
+case "${OMNILINGUAL_SETUP_SKIP_CHECKS:-}" in 1|yes|true) SKIP_CHECKS=1 ;; esac
 
 usage() {
     sed -n '2,/^set -euo/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'
@@ -102,6 +118,8 @@ while [[ $# -gt 0 ]]; do
         -y|--yes)   ASSUME_YES=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --reset)   RESET=1; shift ;;
+        --check)   CHECK_ONLY=1; DRY_RUN=1; ASSUME_YES=1; shift ;;
+        --skip-checks) SKIP_CHECKS=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
     esac
@@ -191,6 +209,11 @@ else
     ARM64=0
 fi
 
+RAM_GB=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+NCPU="$(sysctl -n hw.ncpu 2>/dev/null || echo '?')"
+CPU_BRAND="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+[[ -n "$CPU_BRAND" ]] || CPU_BRAND="$ARCH"
+
 # Must precede any formula probe: on Apple Silicon brew is off PATH until this runs
 brew_env() {
     if [[ -x /opt/homebrew/bin/brew ]]; then
@@ -211,8 +234,46 @@ trap cleanup EXIT
 
 # ---------------------------------------------------------------- configuration
 
-ALL_EXTRAS="local-stt diarize local-mt ui"
+ALL_EXTRAS="local-stt indic-stt diarize local-mt ui"
 ALL_KEYS="SARVAM_API_KEY GROQ_API_KEY GEMINI_API_KEY"
+
+# The id the setup script probes for Hugging Face access; must equal
+# config.DEFAULT_STT_MODELS["indic-transcribe"] (a test pins this).
+INDIC_STT_MODEL="bodhan-ai/indic-transcribe-core"
+
+# extra_blocker <extra> -> prints why this host cannot run it; prints nothing when
+# it can. One predicate shared by the prompt (to mark choices) and the host check
+# (to refuse them), so what is offered and what is allowed cannot drift apart.
+extra_blocker() {
+    case "$1" in
+        indic-stt)
+            if [[ $ARM64 -ne 1 ]]; then
+                printf 'needs Apple Silicon: PyTorch publishes no wheels for Intel Macs'
+            elif [[ $TRANSLATED -eq 1 ]]; then
+                printf 'this shell runs under Rosetta, so uv would fetch an x86_64 Python that has no PyTorch wheel; re-run from a native Terminal'
+            elif (( MACOS_MAJOR < 14 )); then
+                printf 'PyTorch wheels need macOS 14+ (this Mac is macOS %s)' "$MACOS_VERSION"
+            elif (( RAM_GB > 0 && RAM_GB < 8 )); then
+                printf 'the 1.2B model needs at least 8 GB of RAM (this Mac has %s GB)' "$RAM_GB"
+            fi
+            ;;
+    esac
+}
+
+# Rough sizes in tenths of a GB, so the arithmetic stays integer in bash 3.2.
+# install = venv + wheels; weights = what the model download adds.
+install_tenths() {
+    case "$1" in
+        local-stt) echo 5 ;; indic-stt) echo 25 ;; diarize) echo 2 ;; local-mt) echo 3 ;; ui) echo 3 ;; *) echo 0 ;;
+    esac
+}
+weights_tenths() {
+    case "$1" in
+        local-stt) if [[ $ARM64 -eq 1 ]]; then echo 15; else echo 5; fi ;;
+        indic-stt) echo 49 ;; diarize) echo 1 ;; local-mt) echo 9 ;; *) echo 0 ;;
+    esac
+}
+tenths_str() { printf '%s.%s' $(( $1 / 10 )) $(( $1 % 10 )); }
 
 EXTRAS="local-stt,diarize,ui"
 KEYS=""
@@ -332,6 +393,7 @@ prompt_extras() {
             say "Capabilities to install"
             printf '    %s\n' \
                 "local-stt  offline speech-to-text (mlx-whisper here; faster-whisper on Intel)" \
+                "indic-stt  offline Indic speech-to-text, best accuracy (Indic-Transcribe-core, ~4.9 GB, gated)" \
                 "diarize    speaker labels via sherpa-onnx   (+86 MB of models)" \
                 "local-mt   offline Indic translation via CTranslate2 (+850 MB of models)" \
                 "ui         local browser UI window (FastAPI + pywebview), no models to fetch"
@@ -349,6 +411,11 @@ prompt_extras() {
                 printf '    this Mac is Intel (x86_64): MLX does not exist here, so local-stt uses\n'
                 printf '    faster-whisper on CPU instead.\n'
             fi
+            local e why
+            for e in $ALL_EXTRAS; do
+                why="$(extra_blocker "$e")"
+                [[ -n "$why" ]] && printf '    %s is NOT available here: %s\n' "$e" "$why"
+            done
             printf '    comma-separated, or none. Enter keeps [%s]\n' "$cur"
         } >&2
         read -r -p "    capabilities: " ans || ans=""
@@ -448,6 +515,7 @@ extra_active() {
     local pkg
     case "$1" in
         local-stt) if [[ $ARM64 -eq 1 ]]; then pkg=mlx_whisper; else pkg=faster_whisper; fi ;;
+        indic-stt) pkg=torch ;;
         diarize)   pkg=sherpa_onnx ;;
         local-mt)  pkg=ctranslate2 ;;
         # fastapi is the marker: declared first by the ui extra, pulled in by no
@@ -467,7 +535,7 @@ extra_active() {
 # capability that has none would be a lie.
 prefetchable() {
     case "$1" in
-        local-stt|diarize|local-mt) return 0 ;;
+        local-stt|indic-stt|diarize|local-mt) return 0 ;;
         # ui is not here and does not need an arm: it ships wheels, not weights.
         *) return 1 ;;
     esac
@@ -484,6 +552,9 @@ prefetch_label() {
             ;;
         local-mt)
             printf 'IndicTrans2 int8 (~850 MB)'
+            ;;
+        indic-stt)
+            printf 'Indic-Transcribe-core (~4.9 GB, gated)'
             ;;
         # Failing is the honest answer: ui ships wheels, not weights, so there is
         # no label for it. The caller skips on failure, so this arm is what makes
@@ -521,6 +592,15 @@ print("ok")
 PY
             fi
             ;;
+        indic-stt)
+            # Gated: needs `hf auth login` and the licence accepted on the model page.
+            # snapshot_download resumes, so a re-run continues a half-finished fetch.
+            in_repo uv run python - <<'PY'
+from huggingface_hub import snapshot_download
+from omnilingual.config import DEFAULT_STT_MODELS
+print(snapshot_download(DEFAULT_STT_MODELS["indic-transcribe"]))
+PY
+            ;;
         local-mt)
             in_repo uv run python - <<'PY'
 from pathlib import Path
@@ -537,6 +617,189 @@ PY
             return 1
             ;;
     esac
+}
+
+
+# ------------------------------------------------------------- host due diligence
+
+PF_FAILS=0
+PF_WARNS=0
+pf_ok()   { printf '\033[32m  ok\033[0m %s\n' "$*" >&2; }
+pf_info() { printf '\033[2m  ..\033[0m %s\n' "$*" >&2; }
+pf_warn() { printf '\033[33m  !!\033[0m %s\n' "$*" >&2; PF_WARNS=$(( PF_WARNS + 1 )); }
+pf_fail() { printf '\033[31m  xx\033[0m %s\n' "$*" >&2; PF_FAILS=$(( PF_FAILS + 1 )); }
+
+HF_HOME_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
+HF_HUB_DIR="${HF_HUB_CACHE:-$HF_HOME_DIR/hub}"
+
+# free_tenths <path> -> free space of the volume holding path (nearest existing
+# ancestor), in tenths of a GB; empty when df cannot tell.
+free_tenths() {
+    local p="$1" kb
+    while [[ ! -e "$p" && "$p" != "/" ]]; do p="$(dirname "$p")"; done
+    kb="$(df -k "$p" 2>/dev/null | awk 'NR==2{print $4}')"
+    [[ "$kb" =~ ^[0-9]+$ ]] || return 0
+    printf '%s' $(( kb * 10 / 1048576 ))
+}
+# volume_id <path> -> the device df reports, so two paths on one disk are summed.
+volume_id() {
+    local p="$1"
+    while [[ ! -e "$p" && "$p" != "/" ]]; do p="$(dirname "$p")"; done
+    df -k "$p" 2>/dev/null | awk 'NR==2{print $1}'
+}
+
+# http_status <url> [token] -> status code, 000 when unreachable. The token goes to
+# curl on stdin as a config line: in argv it would show up in `ps`.
+http_status() {
+    local url="$1" token="${2:-}"
+    if [[ -n "$token" ]]; then
+        printf 'header = "Authorization: Bearer %s"\n' "$token" \
+            | curl -s -o /dev/null -w '%{http_code}' --max-time 8 -K - "$url" 2>/dev/null || true
+    else
+        curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$url" 2>/dev/null || true
+    fi
+}
+reachable() { local c; c="$(http_status "$1")"; [[ -n "$c" && "$c" != "000" ]]; }
+
+# hf_token -> the token huggingface_hub would use (env first, then the login file).
+hf_token() {
+    local t="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}" f="${HF_TOKEN_PATH:-$HF_HOME_DIR/token}"
+    if [[ -z "$t" && -f "$f" ]]; then t="$(tr -d '[:space:]' < "$f")"; fi
+    printf '%s' "$t"
+}
+
+indic_weights_cached() {
+    local d="$HF_HUB_DIR/models--${INDIC_STT_MODEL//\//--}/snapshots" f
+    [[ -d "$d" ]] || return 1
+    for f in "$d"/*/model.safetensors; do [[ -e "$f" ]] && return 0; done
+    return 1
+}
+
+# preflight — read-only. Every check ends in ok / warning (!!) / blocker (xx); a blocker
+# means the selected capabilities cannot work on this machine as asked.
+preflight() {
+    PF_FAILS=0; PF_WARNS=0
+    local e why code tok need_repo free_repo free_home net_ok h hosts=""
+
+    say "Host check"
+    pf_info "macOS $MACOS_VERSION, $CPU_BRAND, $NCPU cores, ${RAM_GB} GB RAM"
+    if [[ $ARM64 -eq 1 ]]; then
+        pf_ok "Apple Silicon: MLX and Metal (MPS) acceleration are available"
+        [[ $TRANSLATED -eq 1 ]] && pf_warn "this shell is translated by Rosetta 2; re-run from a native Terminal for arm64 packages"
+    else
+        pf_info "Intel Mac: local-stt uses faster-whisper on CPU; indic-stt is unavailable"
+    fi
+    command -v xcode-select >/dev/null 2>&1 && xcode-select -p >/dev/null 2>&1 \
+        && pf_ok "Xcode command-line tools present" \
+        || pf_warn "Xcode command-line tools missing: the apply step will trigger Apple's installer and ask you to re-run"
+
+    # Can this machine run what was asked for?
+    for e in $ALL_EXTRAS; do
+        in_list "$e" "$EXTRAS" || continue
+        why="$(extra_blocker "$e")"
+        if [[ -n "$why" ]]; then
+            pf_fail "$e cannot run here: $why. Re-run with --extras listing the others (without $e)"
+        fi
+    done
+    if in_list local-stt "$EXTRAS" && [[ $ARM64 -eq 1 ]] && (( MACOS_MAJOR < 14 )); then
+        pf_warn "local-stt: MLX needs macOS 14+ (this is $MACOS_VERSION); pass --stt faster-whisper to transcribe on CPU"
+    fi
+    if in_list indic-stt "$EXTRAS" && [[ -z "$(extra_blocker indic-stt)" ]]; then
+        if (( RAM_GB < 16 )); then
+            pf_warn "indic-stt: ${RAM_GB} GB RAM is tight for a 4.9 GB model plus the OS; expect swapping, close other apps"
+        else
+            pf_ok "indic-stt: ${RAM_GB} GB RAM is enough for the 1.2B model on the GPU (~12-28x realtime measured on an M4 Max)"
+        fi
+    fi
+    if in_list local-mt "$EXTRAS" && (( RAM_GB > 0 && RAM_GB < 8 )); then
+        pf_warn "local-mt: ${RAM_GB} GB RAM is low for IndicTrans2; translation may be slow"
+    fi
+
+    # Disk: what the apply step will add, against what is free where it lands.
+    local repo_t=0 home_t=0
+    [[ -n "$MISSING_FORMULAS" ]] && repo_t=$(( repo_t + 5 ))
+    for e in $ADD_EXTRAS; do repo_t=$(( repo_t + $(install_tenths "$e") )); done
+    if yes_no "$PREFETCH"; then
+        for e in $EXTRAS_LIST; do
+            prefetchable "$e" || continue
+            if [[ "$e" == indic-stt ]] && indic_weights_cached; then continue; fi
+            home_t=$(( home_t + $(weights_tenths "$e") ))
+        done
+    fi
+    # +20 % margin: wheels are unpacked next to uv's cache copy.
+    repo_t=$(( repo_t * 12 / 10 )); home_t=$(( home_t * 12 / 10 ))
+    free_repo="$(free_tenths "$REPO_ROOT")"; free_home="$(free_tenths "$HF_HOME_DIR")"
+    if [[ -z "$free_repo" || -z "$free_home" ]]; then
+        pf_warn "could not read free disk space; skipping the disk check"
+    elif [[ "$(volume_id "$REPO_ROOT")" == "$(volume_id "$HF_HOME_DIR")" ]]; then
+        need_repo=$(( repo_t + home_t ))
+        if (( free_repo < need_repo )); then
+            pf_fail "disk: need ~$(tenths_str "$need_repo") GB free, only $(tenths_str "$free_repo") GB available"
+        elif (( free_repo < need_repo + 50 )); then
+            pf_warn "disk: ~$(tenths_str "$need_repo") GB needed, $(tenths_str "$free_repo") GB free (under 5 GB headroom)"
+        else
+            pf_ok "disk: ~$(tenths_str "$need_repo") GB needed, $(tenths_str "$free_repo") GB free"
+        fi
+    else
+        if (( free_repo < repo_t )); then pf_fail "disk (repo volume): need ~$(tenths_str "$repo_t") GB, only $(tenths_str "$free_repo") GB free"
+        else pf_ok "disk (repo volume): ~$(tenths_str "$repo_t") GB needed, $(tenths_str "$free_repo") GB free"; fi
+        if (( free_home < home_t )); then pf_fail "disk (model cache $HF_HOME_DIR): need ~$(tenths_str "$home_t") GB, only $(tenths_str "$free_home") GB free"
+        else pf_ok "disk (model cache): ~$(tenths_str "$home_t") GB needed, $(tenths_str "$free_home") GB free"; fi
+    fi
+
+    # Network: only the hosts this run will actually talk to.
+    case "${UV_OFFLINE:-}" in
+        1|true|yes) pf_info "UV_OFFLINE is set: network checks skipped" ; net_ok=0 ;;
+        *) net_ok=1 ;;
+    esac
+    if [[ $net_ok -eq 1 ]]; then
+        [[ -n "$ADD_EXTRAS" ]] && hosts="$hosts https://pypi.org/simple/"
+        [[ -n "$MISSING_FORMULAS" ]] && hosts="$hosts https://formulae.brew.sh/"
+        if yes_no "$PREFETCH" || in_list indic-stt "$ADD_EXTRAS"; then
+            for e in $EXTRAS_LIST; do prefetchable "$e" && { hosts="$hosts https://huggingface.co/"; break; }; done
+        fi
+        for h in $hosts; do
+            case " $SEEN_HOSTS " in *" $h "*) continue ;; esac
+            SEEN_HOSTS="$SEEN_HOSTS $h"
+            if reachable "$h"; then pf_ok "network: $h reachable"; else pf_fail "network: cannot reach $h (offline, proxy or firewall?)"; fi
+        done
+        [[ -z "$hosts" ]] && pf_info "nothing to download: network checks not needed"
+    fi
+
+    # Hugging Face: the gated model fails late and obscurely, so test it now.
+    if in_list indic-stt "$EXTRAS" && [[ -z "$(extra_blocker indic-stt)" ]]; then
+        if indic_weights_cached; then
+            pf_ok "indic-stt: model already in the Hugging Face cache, no access needed"
+        else
+            tok="$(hf_token)"
+            if [[ -z "$tok" ]]; then
+                pf_warn "indic-stt: no Hugging Face token found. Accept the licence at https://huggingface.co/$INDIC_STT_MODEL then log in (the apply step offers 'hf auth login')"
+            elif [[ $net_ok -eq 1 ]]; then
+                code="$(http_status "https://huggingface.co/$INDIC_STT_MODEL/resolve/main/config.json" "$tok")"
+                case "$code" in
+                    200|302) pf_ok "indic-stt: Hugging Face token has access to $INDIC_STT_MODEL" ;;
+                    401)     pf_fail "indic-stt: Hugging Face rejected the token (401); run 'hf auth login' with a valid read token" ;;
+                    403)     pf_fail "indic-stt: licence not accepted for this token (403); accept it at https://huggingface.co/$INDIC_STT_MODEL and, for a fine-grained token, tick 'public gated repos'" ;;
+                    000)     pf_warn "indic-stt: could not reach huggingface.co to verify access" ;;
+                    *)       pf_warn "indic-stt: unexpected HTTP $code while verifying Hugging Face access" ;;
+                esac
+            else
+                pf_info "indic-stt: Hugging Face token found (access not verified offline)"
+            fi
+        fi
+    fi
+
+    if (( PF_FAILS > 0 )); then
+        printf '\n' >&2
+        if [[ $SKIP_CHECKS -eq 1 ]]; then
+            warn "$PF_FAILS blocking problem(s) above ignored (--skip-checks)."
+        else
+            warn "$PF_FAILS blocking problem(s) found; $PF_WARNS warning(s)."
+        fi
+    else
+        pf_ok "host check passed ($PF_WARNS warning(s))"
+    fi
+    printf '\n' >&2
 }
 
 # ============================================================== 1. ask
@@ -582,7 +845,9 @@ for e in $ALL_EXTRAS; do
     PREFETCH_EXTRAS="${PREFETCH_EXTRAS:+$PREFETCH_EXTRAS }$e"
 done
 if [[ -n "$PREFETCH_EXTRAS" ]]; then
-    ask_yes_no_setting PREFETCH "Download model weights now (~2.4 GB) instead of on first use?"
+    PREFETCH_T=0
+    for e in $PREFETCH_EXTRAS; do PREFETCH_T=$(( PREFETCH_T + $(weights_tenths "$e") )); done
+    ask_yes_no_setting PREFETCH "Download model weights now (~$(tenths_str "$PREFETCH_T") GB) instead of on first use?"
 else
     # True whether nothing at all was selected or only a weightless `ui` was.
     skip "no selected capability ships model weights, nothing to pre-download"
@@ -610,12 +875,24 @@ for e in $ALL_EXTRAS; do
     fi
 done
 
+SEEN_HOSTS=""
+EXTRAS_LIST="${EXTRAS//,/ }"
+preflight
+
+if [[ $CHECK_ONLY -eq 1 ]]; then
+    exit $(( PF_FAILS > 0 ? 1 : 0 ))
+fi
+if (( PF_FAILS > 0 )) && [[ $SKIP_CHECKS -eq 0 && $DRY_RUN -eq 0 ]]; then
+    die "this machine cannot satisfy the selected capabilities; fix the items marked xx, or re-run with --extras to choose differently (--skip-checks overrides)"
+fi
+
 {
     printf '\n'
     say "Plan"
     if [[ $ARM64 -eq 1 ]]; then
         printf '    detected                : Apple Silicon (arm64)%s\n' \
             "$( [[ $TRANSLATED -eq 1 ]] && printf ', via a translated shell' )"
+        in_list indic-stt "$EXTRAS" && printf '    indic-stt backend       : Indic-Transcribe-core on Metal (MPS)\n'
         printf '    local-stt backend       : mlx-whisper%s\n' \
             "$( (( MACOS_MAJOR < 14 )) && printf '  WARNING: needs macOS 14+, use --stt faster-whisper' )"
     else
@@ -760,6 +1037,16 @@ else
     skip "live capture not configured (re-run and answer yes to enable it)"
 fi
 
+# --- Hugging Face login (gated models) --------------------------------------
+if in_list indic-stt "$EXTRAS" && ! indic_weights_cached && [[ -z "$(hf_token)" ]]; then
+    step "indic-stt downloads a gated model: accept the licence at https://huggingface.co/$INDIC_STT_MODEL, then log in"
+    if interactive && confirm "    Run 'hf auth login' now?" y; then
+        in_repo uv run hf auth login || warn "hf auth login did not finish; the model download below will be skipped until you log in"
+    else
+        warn "no Hugging Face login: run 'cd $REPO_ROOT && uv run hf auth login', then re-run me to fetch the model"
+    fi
+fi
+
 # --- model prefetch ---------------------------------------------------------
 if yes_no "$PREFETCH"; then
     for e in $ALL_EXTRAS; do
@@ -818,6 +1105,9 @@ fi
     # default changed sees no ui at all. Telling them the line to edit beats
     # editing their saved answers, which would silently answer a question they
     # were never asked.
+    if in_list indic-stt "$EXTRAS"; then
+        printf '    uv run omnilingual REC.m4a --stt indic-transcribe --langs hi-IN,en-IN --mt gemini   # free STT; --langs narrows language ID\n'
+    fi
     if in_list ui "$EXTRAS"; then
         printf '    uv run omnilingual-ui                     # the windowed app\n'
     else

@@ -19,6 +19,10 @@ def build_stt(settings: Settings) -> STTProvider:
         from omnilingual.stt.faster_whisper import FasterWhisperSTT
 
         return FasterWhisperSTT(settings)
+    if settings.stt_provider == "indic-transcribe":
+        from omnilingual.stt.indic_transcribe import IndicTranscribeSTT
+
+        return IndicTranscribeSTT(settings)
 
     from omnilingual.stt.sarvam import SarvamSTT
 

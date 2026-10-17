@@ -55,6 +55,14 @@ def test_faster_whisper_provider_without_extra_explains_install(monkeypatch):
         build_stt(load_settings(api_key="k", env={}, stt_provider="faster-whisper"))
 
 
+def test_indic_transcribe_provider_without_extra_explains_install(monkeypatch):
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(ConfigError, match="indic-stt"):
+        build_stt(load_settings(api_key="k", env={}, stt_provider="indic-transcribe"))
+
+
 def test_unknown_provider_rejected():
     with pytest.raises(ConfigError, match="unknown STT provider"):
         load_settings(env={}, stt_provider="bogus")

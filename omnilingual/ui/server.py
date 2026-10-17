@@ -517,7 +517,7 @@ def _stream(state: AppState, loop: asyncio.AbstractEventLoop,
 # --- the setup script ------------------------------------------------------
 
 
-_SETUP_EXTRAS = ("local-stt", "diarize", "local-mt", "ui")
+_SETUP_EXTRAS = ("local-stt", "indic-stt", "diarize", "local-mt", "ui")
 
 
 def _capability_flags(body: dict) -> list[str]:
@@ -751,7 +751,16 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
                 status_code=409)
         try:
             body = await _json_object(request)
-            built = _build(body)
+            # Off the loop: a local provider loads its model while it is built
+            # (indic-transcribe reads ~4.9 GB, and downloads it on the first run), and
+            # that must not freeze /api/health and the WebSocket meanwhile.
+            built = await anyio.to_thread.run_sync(_build, body)
+            # The build above is the only await between the busy check and the start,
+            # so this re-check is what keeps two overlapping starts from both running.
+            if state.busy() is not None:
+                return JSONResponse(
+                    {"error": "a run is already in progress; stop it first"},
+                    status_code=409)
             # After validation, before the thread: cli.py gates ffmpeg here too, and
             # a missing binary discovered three seconds into a run is a worse answer.
             ensure_ffmpeg()
@@ -791,7 +800,7 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
     async def get_runs(request: Request) -> dict:
         return {"runs": _catalogue(state)}
 
-    def _recover(session_dir: Path, out: Path):
+    def _recover(session_dir: Path, out: Path, providers: tuple | None = None):
         """Start a replay of a saved session's chunks.
 
         Shared by the route and the WebSocket's recover message so both reach the
@@ -799,7 +808,7 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
         chunks that are already on disk, so it needs no source file and no ffmpeg.
         """
         body = settings.load()
-        config, stt, translator, diarizer = build_run(body)
+        config, stt, translator, diarizer = providers or build_run(body)
         return _start(state, {"session_dir": session_dir, "out": out,
                               "settings": config, "stt": stt,
                               "translator": translator, "diarizer": diarizer,
@@ -821,7 +830,12 @@ def create_app(*, token: str | None = None, port: int | None = None) -> FastAPI:
             if not session_dir.is_dir():
                 raise ConfigError(f"{session_dir} is not a session dir")
             out = _output_path(body, fallback=_RECOVERED_OUT)
-            runner = _recover(session_dir, out)
+            providers = await anyio.to_thread.run_sync(build_run, settings.load())
+            if state.busy() is not None:
+                return JSONResponse(
+                    {"error": "a run is already in progress; stop it first"},
+                    status_code=409)
+            runner = _recover(session_dir, out, providers)
         except (ConfigError, OSError, ImportError) as exc:
             # OSError is the output directory; ConfigError is everything else; and a
             # missing extra has to be a refusal here too, for the reason post_start

@@ -35,6 +35,7 @@ Optional extras, added on demand:
 
 ```bash
 uv sync --extra local-stt    # local Whisper (Apple Silicon or Intel CPU)
+uv sync --extra indic-stt    # Indic-Transcribe-core (Apple Silicon; gated model, see below)
 uv sync --extra diarize      # speaker diarization
 uv sync --extra local-mt     # local IndicTrans2 translation (--mt indictrans2)
 ```
@@ -42,6 +43,20 @@ uv sync --extra local-mt     # local IndicTrans2 translation (--mt indictrans2)
 `uv sync` installs exactly what it is asked for and removes the rest, so name
 every extra you want in one command — `uv sync --extra local-stt --extra diarize`
 — or the second `uv sync` uninstalls the first one's packages.
+
+### Setting up another Mac
+
+`scripts/setup-mac.sh` installs the toolchain and your chosen extras and is safe
+to re-run. Before changing anything it checks the host — macOS version, Apple
+Silicon vs Intel (and Rosetta), RAM, free disk against what the selection needs,
+reachability of PyPI / Homebrew / Hugging Face, and, for `indic-stt`, that your
+Hugging Face token has accepted the model's licence — and stops with the reason
+if the selection cannot work there.
+
+```bash
+./scripts/setup-mac.sh --check --extras local-stt,indic-stt   # check only: changes nothing, exit 1 if blocked
+./scripts/setup-mac.sh --extras local-stt,indic-stt,ui        # install; answers are saved and replayed on re-run
+```
 
 ## Use
 
@@ -112,13 +127,14 @@ tool at a different work directory and abandons the cache built under the old on
 | `sarvam` (default) | ~₹30/hr | `SARVAM_API_KEY` | Saaras, trained on Indian audio including Hindi-English code-mix. |
 | `mlx-whisper` | free | `uv sync --extra local-stt` (Apple Silicon only) | Runs `mlx-community/whisper-large-v3-turbo` on-device; the first run downloads ~1.5 GB. Audio never leaves the machine. |
 | `faster-whisper` | free | `uv sync --extra local-stt` (Intel Macs and Linux) | Runs Whisper `small` by default (override with `--stt-model`) on CPU via CTranslate2 int8; the first run downloads ~500 MB. The local option for Intel Macs, where MLX is unavailable. |
+| `indic-transcribe` | free | `uv sync --extra indic-stt`, then accept the licence at [bodhan-ai/indic-transcribe-core](https://huggingface.co/bodhan-ai/indic-transcribe-core) and `hf auth login` | Runs Bodhan AI's 1.2B Indic-Transcribe-core on-device (Apple GPU via Metal, else CUDA/CPU); the first run downloads ~4.9 GB. 25 languages incl. English. Measured on an M4 Max: ~12–28× realtime and, with the language given, FLEURS WER of 0.11 (Hindi), 0.24 (Tamil), 0.07 (English). Language ID is restricted to `--langs` when set (recommended: free-choice ID is weak for Hindi). Code-mixed speech comes out with English words transliterated into Devanagari, unlike Saaras which keeps them in Latin. Licensed under the Indic Open Model License v1.0, not MIT. |
 | `groq` | ~₹3.4/hr ($0.04/hr) | `GROQ_API_KEY` from https://console.groq.com | Hosted `whisper-large-v3-turbo`, much faster than real time. Groq bills a 10 s minimum per request, so short live chunks cost slightly more than the headline rate. |
 
 The same `local-stt` extra installs whichever local engine your platform
 supports — MLX on Apple Silicon, faster-whisper everywhere else (on Intel Macs
 it pins `onnxruntime<1.24`, the last release with an x86_64 wheel).
 
-All four auto-detect the language of every chunk, so multi-language meetings
+All five auto-detect the language of every chunk, so multi-language meetings
 work unchanged, and detected codes are normalized to Sarvam's `xx-IN` set,
 which is what the translator and the `--langs` filter expect. One caveat: Groq
 does not report a detection confidence, so its transcripts show `0.00` where
@@ -260,6 +276,7 @@ uv run pytest -q                              # unit + integration (mocked HTTP)
 SARVAM_API_KEY=... uv run pytest --run-live   # two real Sarvam API calls, costs a few paise
 uv run pytest --run-mlx                       # real local Whisper via MLX (Apple Silicon)
 uv run pytest --run-faster-whisper            # real local Whisper on CPU (downloads ~500 MB)
+uv run pytest --run-indic-transcribe          # real Indic-Transcribe-core (gated, downloads ~4.9 GB)
 uv run pytest --run-diarize                   # real sherpa-onnx diarization (downloads ~40 MB)
 ```
 

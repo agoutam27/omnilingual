@@ -67,7 +67,8 @@ def run(tmp_path: Path, *args: str, env: dict[str, str] | None = None) -> subpro
     these results depend on their machine, which is how nine of eleven cases used
     to pass here and fail in CI.
     """
-    base = {**os.environ, "XDG_CONFIG_HOME": str(tmp_path), "UV_OFFLINE": "1"}
+    base = {**os.environ, "XDG_CONFIG_HOME": str(tmp_path), "UV_OFFLINE": "1",
+            "OMNILINGUAL_SETUP_SKIP_CHECKS": "1"}
     if env:
         base.update(env)
     return subprocess.run(
@@ -121,7 +122,8 @@ def save_only(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=300,
-        env={**os.environ, "XDG_CONFIG_HOME": str(config_home), "UV_OFFLINE": "1"},
+        env={**os.environ, "XDG_CONFIG_HOME": str(config_home), "UV_OFFLINE": "1",
+             "OMNILINGUAL_SETUP_SKIP_CHECKS": "1"},
     )
 
 
@@ -215,3 +217,160 @@ def test_the_flag_declarations_sit_above_the_parse_loop():
         declaration = re.search(rf"^{name}=0$", body, re.M)
         assert declaration, f"{name} is never declared"
         assert declaration.start() < loop, f"{name} is declared after the parse loop and will be reset"
+
+
+# --- host due diligence ------------------------------------------------------
+#
+# The host facts come from sysctl / uname / sw_vers / df / curl. These tests put
+# stand-ins for those on PATH, so each case describes a machine (Intel, old macOS,
+# 4 GB, a full disk, a Hugging Face 403) and the verdict does not depend on the
+# machine running the suite.
+
+SHIMS = {
+    "sysctl": r'''#!/bin/bash
+case "$*" in
+  *hw.optional.arm64*)     echo "${FAKE_ARM64:-1}" ;;
+  *hw.memsize*)            echo $(( ${FAKE_RAM_GB:-64} * 1073741824 )) ;;
+  *sysctl.proc_translated*) echo 0 ;;
+  *hw.ncpu*)               echo 8 ;;
+  *machdep.cpu.brand_string*) echo "Fake CPU" ;;
+  *) exec /usr/sbin/sysctl "$@" ;;
+esac
+''',
+    "uname": r'''#!/bin/bash
+if [[ "$*" == "-m" ]]; then echo "${FAKE_ARCH:-arm64}"; else exec /usr/bin/uname "$@"; fi
+''',
+    "sw_vers": r'''#!/bin/bash
+if [[ "$*" == "-productVersion" ]]; then echo "${FAKE_MACOS:-15.0}"; else exec /usr/bin/sw_vers "$@"; fi
+''',
+    "df": "#!/bin/bash\necho 'Filesystem 1024-blocks Used Available Capacity Mounted'\n"
+          "echo \"/dev/fake 999999999 1 ${FAKE_FREE_KB:-500000000} 1% /\"\n",
+    "curl": r'''#!/bin/bash
+cat >/dev/null 2>&1 </dev/stdin || true
+url="${@: -1}"
+case "$url" in
+  *huggingface.co/*resolve*) echo "${FAKE_HF_CODE:-200}" ;;
+  *) echo "${FAKE_NET_CODE:-200}" ;;
+esac
+''',
+}
+
+
+def host(tmp_path: Path, *args: str, **fake: str) -> subprocess.CompletedProcess:
+    """Run the real script on a described machine (see SHIMS)."""
+    bin_dir = tmp_path / "shims"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in SHIMS.items():
+        f = bin_dir / name
+        f.write_text(body, encoding="utf-8")
+        f.chmod(0o755)
+    env = {k: v for k, v in os.environ.items()
+           if k not in {"UV_OFFLINE", "OMNILINGUAL_SETUP_SKIP_CHECKS", "HF_TOKEN",
+                        "HUGGING_FACE_HUB_TOKEN"}}
+    env.update(
+        PATH=f"{bin_dir}:{env['PATH']}",
+        XDG_CONFIG_HOME=str(tmp_path / "cfg"),
+        HF_HOME=str(tmp_path / "hf"),
+        **{f"FAKE_{k.upper()}": v for k, v in fake.items() if k != "hf_token"},
+    )
+    if "hf_token" in fake:
+        env["HF_TOKEN"] = fake["hf_token"]
+    return subprocess.run(["/bin/bash", str(SCRIPT), *args], capture_output=True,
+                          text=True, timeout=300, env=env)
+
+
+def verdict(result: subprocess.CompletedProcess) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", result.stderr)
+
+
+def test_check_passes_on_a_capable_mac_and_changes_nothing(tmp_path):
+    result = host(tmp_path, "--check", "--extras", "local-stt,indic-stt", hf_token="t")
+    assert result.returncode == 0, verdict(result)
+    assert "host check passed" in verdict(result)
+    assert not (tmp_path / "cfg").exists(), "--check must not save answers"
+
+
+@pytest.mark.parametrize(("fake", "reason"), [
+    (dict(arm64="0", arch="x86_64"), "needs Apple Silicon"),
+    (dict(macos="13.6"), "macOS 14+"),
+    (dict(ram_gb="4"), "at least 8 GB"),
+])
+def test_indic_stt_is_refused_on_a_machine_that_cannot_run_it(tmp_path, fake, reason):
+    result = host(tmp_path, "--check", "--extras", "indic-stt", **fake)
+    assert result.returncode == 1, verdict(result)
+    assert reason in verdict(result)
+
+
+def test_other_extras_are_not_blocked_by_indic_stts_requirements(tmp_path):
+    result = host(tmp_path, "--check", "--extras", "diarize,ui", arm64="0", arch="x86_64")
+    assert result.returncode == 0, verdict(result)
+
+
+def test_a_full_disk_blocks(tmp_path):
+    result = host(tmp_path, "--check", "--extras", "indic-stt", free_kb="2000000", hf_token="t")
+    assert result.returncode == 1
+    assert "disk: need" in verdict(result)
+
+
+@pytest.mark.parametrize(("code", "needle", "exit_code"), [
+    ("403", "licence not accepted", 1),
+    ("401", "rejected the token", 1),
+    ("200", "has access", 0),
+])
+def test_hugging_face_access_is_verified_before_the_download(tmp_path, code, needle, exit_code):
+    result = host(tmp_path, "--check", "--extras", "indic-stt", hf_code=code, hf_token="t")
+    assert result.returncode == exit_code, verdict(result)
+    assert needle in verdict(result)
+
+
+def test_a_missing_token_is_a_warning_with_the_fix(tmp_path):
+    result = host(tmp_path, "--check", "--extras", "indic-stt")
+    assert result.returncode == 0, verdict(result)
+    assert "no Hugging Face token" in verdict(result)
+
+
+def test_an_unreachable_network_blocks_what_needs_downloads(tmp_path):
+    result = host(tmp_path, "--check", "--extras", "indic-stt", net_code="000", hf_code="000",
+                  hf_token="t")
+    assert result.returncode == 1
+    assert "cannot reach https://pypi.org" in verdict(result)
+
+
+def test_a_blocked_real_run_stops_before_saving_or_installing(tmp_path):
+    result = host(tmp_path, "--yes", "--extras", "indic-stt", arm64="0", arch="x86_64")
+    assert result.returncode == 1
+    assert "cannot satisfy" in verdict(result)
+    assert not (tmp_path / "cfg").exists()
+
+
+def test_skip_checks_downgrades_blockers_for_a_dry_run(tmp_path):
+    result = host(tmp_path, "--dry-run", "--yes", "--skip-checks", "--extras", "indic-stt",
+                  arm64="0", arch="x86_64")
+    assert result.returncode == 0, verdict(result)
+    assert "ignored (--skip-checks)" in verdict(result)
+
+
+# --- the extras list has one source of truth per layer ------------------------
+
+def _script_extras() -> set[str]:
+    return set(re.search(r'^ALL_EXTRAS="([^"]*)"', SCRIPT.read_text(encoding="utf-8"), re.M)
+               .group(1).split())
+
+
+def test_script_extras_match_pyproject_and_the_ui():
+    import tomllib
+
+    declared = set(tomllib.loads((SCRIPT.parents[1] / "pyproject.toml").read_text())
+                   ["project"]["optional-dependencies"])
+    assert _script_extras() == declared
+    # Read from source: importing the server needs the optional ui extra.
+    ui_src = (SCRIPT.parents[1] / "omnilingual" / "ui" / "server.py").read_text(encoding="utf-8")
+    ui_extras = re.search(r"^_SETUP_EXTRAS = \(([^)]*)\)", ui_src, re.M).group(1)
+    assert set(re.findall(r'"([^"]+)"', ui_extras)) == declared
+
+
+def test_the_probed_hugging_face_model_is_the_configured_default():
+    from omnilingual.config import DEFAULT_STT_MODELS
+
+    match = re.search(r'^INDIC_STT_MODEL="([^"]+)"', SCRIPT.read_text(encoding="utf-8"), re.M)
+    assert match and match.group(1) == DEFAULT_STT_MODELS["indic-transcribe"]

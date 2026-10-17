@@ -34,9 +34,19 @@ _WHISPER_TO_BCP47: dict[str, str] = {
     "en": "en-IN", "english": "en-IN",
 }
 
+# Inverse for backends that take ISO codes in (the pipeline's --langs are
+# BCP-47). Only the short codes: the long names are one-way aliases.
+_BCP47_TO_ISO: dict[str, str] = {v: k for k, v in _WHISPER_TO_BCP47.items() if len(k) <= 3}
+
 
 def to_bcp47(code: str) -> str:
     if not code or not code.strip():
         return "unknown"
     code = code.strip().lower()
     return _WHISPER_TO_BCP47.get(code, code)
+
+
+def from_bcp47(code: str) -> str:
+    """Inverse of `to_bcp47` for the languages we know; anything else passes through."""
+    code = code.strip()
+    return _BCP47_TO_ISO.get(code, code)

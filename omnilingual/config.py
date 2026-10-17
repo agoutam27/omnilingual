@@ -11,7 +11,9 @@ class ConfigError(Exception):
     """Raised when required configuration is missing."""
 
 
-STT_PROVIDERS: tuple[str, ...] = ("sarvam", "mlx-whisper", "groq", "faster-whisper")
+STT_PROVIDERS: tuple[str, ...] = (
+    "sarvam", "mlx-whisper", "groq", "faster-whisper", "indic-transcribe",
+)
 
 # stt_model=None means "the provider's own default", so flipping --stt does not
 # drag a Sarvam model id into a Whisper provider (or vice versa).
@@ -20,6 +22,8 @@ DEFAULT_STT_MODELS: dict[str, str] = {
     "mlx-whisper": "mlx-community/whisper-large-v3-turbo",
     "groq": "whisper-large-v3-turbo",
     "faster-whisper": "small",
+    # Gated on Hugging Face (Indic Open Model License); also accepts a local directory.
+    "indic-transcribe": "bodhan-ai/indic-transcribe-core",
 }
 
 MT_PROVIDERS: tuple[str, ...] = ("mayura", "gemini", "indictrans2")

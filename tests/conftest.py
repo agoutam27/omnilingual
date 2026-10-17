@@ -22,6 +22,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="run tests marked faster_whisper (real faster-whisper model, downloads ~500 MB)",
     )
     parser.addoption(
+        "--run-indic-transcribe",
+        action="store_true",
+        default=False,
+        help="run tests marked indic_transcribe (real Indic-Transcribe-core, gated, downloads ~4.9 GB)",
+    )
+    parser.addoption(
         "--run-diarize",
         action="store_true",
         default=False,
@@ -39,6 +45,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     skip_live = pytest.mark.skip(reason="need --run-live to run live tests")
     skip_mlx = pytest.mark.skip(reason="need --run-mlx to run mlx tests (Apple Silicon + local-stt extra)")
     skip_fw = pytest.mark.skip(reason="need --run-faster-whisper to run faster_whisper tests (downloads ~500 MB)")
+    skip_it = pytest.mark.skip(reason="need --run-indic-transcribe to run indic_transcribe tests (gated, ~4.9 GB)")
     skip_dz = pytest.mark.skip(reason="need --run-diarize to run diarize tests (downloads ~40 MB)")
     # Match real marks only. `item.keywords` also holds name-derived keywords, so
     # a plain `"diarize" in item.keywords` test skipped every test under
@@ -53,6 +60,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             and item.get_closest_marker("faster_whisper")
         ):
             item.add_marker(skip_fw)
+        if (
+            not config.getoption("--run-indic-transcribe")
+            and item.get_closest_marker("indic_transcribe")
+        ):
+            item.add_marker(skip_it)
         if not config.getoption("--run-diarize") and item.get_closest_marker("diarize"):
             item.add_marker(skip_dz)
 

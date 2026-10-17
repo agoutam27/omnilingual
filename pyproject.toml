@@ -25,6 +25,19 @@ local-stt = [
     "faster-whisper>=1.0",
     "onnxruntime>=1.14,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
+# Local on-device Indic-Transcribe-core (1.2B, gated on Hugging Face). The model's own
+# code ships inside its repo and needs exactly these (its requirements.txt); torch is
+# the heavy one (~2.5 GB), which is why this is not folded into local-stt.
+# PyTorch publishes no Intel-Mac wheels (the markers keep `uv sync --all-extras`
+# resolvable there; setup-mac.sh refuses indic-stt on such a machine up front).
+indic-stt = [
+    "torch>=2.1; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    "torchaudio>=2.1; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    "transformers>=4.56",
+    "sentencepiece>=0.2",
+    "soundfile>=0.12",
+    "huggingface-hub>=0.27",
+]
 # Speaker diarization via sherpa-onnx (pure ONNX runtime; works on Intel Macs).
 # sherpa-onnx-core is listed explicitly even though sherpa-onnx already depends
 # on it: uv's project resolver drops that transitive entry from uv.lock, so the
@@ -78,5 +91,6 @@ markers = [
     "live: hits the real Sarvam API; needs SARVAM_API_KEY",
     "mlx: runs the real local Whisper model; needs the local-stt extra on Apple Silicon",
     "faster_whisper: runs the real local faster-whisper model; needs the local-stt extra",
+    "indic_transcribe: runs the real Indic-Transcribe-core model; needs the indic-stt extra and gated HF access",
     "diarize: runs the real local diarization models; needs the diarize extra",
 ]
