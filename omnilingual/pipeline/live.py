@@ -166,8 +166,9 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
     whitespace was still billed, so its dropped segment carries a non-zero
     delta. ``accrued`` is the pipeline's own running total, accumulated inside
     the ``if keep:`` branch — it therefore OMITS dropped-but-billed chunks and
-    is the cap counter, not the amount the user paid. A consumer displaying
-    spend must accumulate ``delta`` itself rather than adopt ``accrued``.
+    matches the file header's cost, not the amount the user paid. A consumer
+    displaying spend must accumulate ``delta`` itself rather than adopt
+    ``accrued``. The ``max_cost`` cap is enforced on that true spend.
     A raising callback is logged and swallowed, like ``on_segment``.
     """
     say = status or (lambda msg: None)
@@ -225,7 +226,7 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
     mlock = threading.Lock()
     slicer_lock = threading.Lock()
     gap_box: list[tuple[float, float]] = []
-    state = {"accrued": 0.0, "halt": None, "enqueued": 0, "next": 0,
+    state = {"accrued": 0.0, "spent": 0.0, "halt": None, "enqueued": 0, "next": 0,
              "last_kept_end": 0.0, "sealed_end": 0.0, "sealed_n": 0,
              "appended_n": 0, "appended_end": 0.0, "bad": False, "died": False}
     # An explicit None check, not `stop_event or Event()`: `or` reads truthiness,
@@ -335,7 +336,9 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
             seq, sc = job
             with mlock:
                 halt = state["halt"]
-                over = state["accrued"] >= opts.max_cost
+                # `spent`, not `accrued`: the cap guards money, and a billed
+                # chunk the appender drops was paid for all the same.
+                over = state["spent"] >= opts.max_cost
             if halt is not None or over:
                 if halt is None:
                     halt_once("cost",
@@ -368,6 +371,18 @@ def run_live(opts: LiveOptions, settings, stt, translator, *,
                                   text=_HALT_TEXT["auth"], english=None,
                                   status="stt_failed")
                     item = (seg, 0.0, False)
+                except Exception:  # noqa: BLE001 - see below
+                    # Anything else (a local model crashing, an embedder
+                    # error) fails this chunk only. Letting it escape would
+                    # kill the worker before results[seq] is set, and the
+                    # ordered appender would wait for that seq forever.
+                    log.exception("chunk %d failed", sc.chunk.idx)
+                    seg = Segment(chunk=sc.chunk, lang="unknown", prob=0.0,
+                                  text=STT_FAILED_TEXT, english=None,
+                                  status="stt_failed")
+                    item = (seg, 0.0, False)
+                with mlock:
+                    state["spent"] += item[1]
             with cond:
                 results[seq] = item
                 cond.notify_all()

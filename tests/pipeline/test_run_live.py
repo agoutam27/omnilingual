@@ -574,3 +574,65 @@ def test_a_raising_on_cost_does_not_end_the_run(respx_mock, tmp_path):
 
     assert code == 0, "a raising on_cost ended the run"
     assert (tmp_path / "meeting.md").exists()
+
+
+def test_an_unexpected_provider_error_fails_the_chunk_not_the_run(tmp_path):
+    """A local model raising anything but an API error must not hang the run.
+
+    The worker only knew QuotaError/AuthError; any other exception killed the
+    thread, its result never arrived, and the ordered appender waited forever.
+    """
+
+    class BoomSTT:
+        model = "boom"
+        mode = "transcribe"
+        inr_per_hour = 0.0
+
+        def transcribe(self, wav_path):
+            raise RuntimeError("local model crashed")
+
+    class EchoMT:
+        model = "echo"
+        inr_per_10k_chars = 0.0
+
+        def supports(self, lang):
+            return True
+
+        def to_english(self, text, src_lang):
+            return text
+
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    box = {}
+    th = threading.Thread(target=lambda: box.setdefault("code", run_live(
+        _opts(tmp_path), load_settings(api_key="k", env={}), BoomSTT(), EchoMT(),
+        status=lambda m: None, capture_factory=factory)), daemon=True)
+    th.start()
+    th.join(timeout=20)
+    assert not th.is_alive(), "run_live hung after a worker exception"
+    assert box["code"] == 2
+    text = (tmp_path / "meeting.md").read_text(encoding="utf-8")
+    assert text.count("[transcription failed]") == 3
+
+
+@respx.mock
+def test_cost_cap_counts_billed_chunks_the_file_drops(respx_mock, tmp_path):
+    """The cap guards spend, so a billed whitespace answer counts toward it.
+
+    Chunk 1 (20 s) and the whitespace chunk 2 (24 s) are both billed, ~₹0.37
+    together, but only chunk 1 (~₹0.17) is kept. A ₹0.3 cap must therefore
+    stop chunk 3; counting kept chunks alone would let it through.
+    """
+    _route(respx_mock, texts=("Bravo", "   ", "Vanakkam"))
+    pcm = _pcm_3x20()
+    factory = lambda *a, **k: FakeCapture(*a, **k, blocks=_blocks(pcm), gated=_gaps())
+    settings = load_settings(api_key="k")
+    from omnilingual.stt.sarvam import SarvamSTT
+    from omnilingual.translate.mayura import MayuraTranslator
+
+    run_live(_opts(tmp_path, stt_workers=1, max_cost=0.3), settings,
+             SarvamSTT(settings), MayuraTranslator(settings),
+             status=lambda m: None, capture_factory=factory)
+    text = (tmp_path / "meeting.md").read_text(encoding="utf-8")
+    assert "Vanakkam" not in text
+    assert "cost cap reached" in text
