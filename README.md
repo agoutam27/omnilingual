@@ -39,6 +39,10 @@ uv sync --extra diarize      # speaker diarization
 uv sync --extra local-mt     # local IndicTrans2 translation (--mt indictrans2)
 ```
 
+`uv sync` installs exactly what it is asked for and removes the rest, so name
+every extra you want in one command — `uv sync --extra local-stt --extra diarize`
+— or the second `uv sync` uninstalls the first one's packages.
+
 ## Use
 
 In Zoom, enable **Record to this computer**. After the meeting, run:
@@ -205,7 +209,8 @@ as `translation failed` and left untranslated rather than dropped, so a later
 run redoes only the failures:
 
 ```bash
-uv run omnilingual meeting.m4a --stt groq --mt gemini --from-chunks <session dir>
+uv run omnilingual meeting.m4a --stt groq --mt gemini                      # a recording: re-run the same command
+uv run omnilingual --from-chunks <session dir> --stt groq --mt gemini      # a live session
 ```
 
 If you would rather not think about quotas at all, use
