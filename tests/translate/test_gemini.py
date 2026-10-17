@@ -131,3 +131,12 @@ def test_missing_key_fails_before_any_request():
 
 def test_cache_key_is_namespaced_by_provider_model():
     assert GeminiTranslator(load_settings(env={}, mt_provider="gemini")).model == "gemini:gemini-3.5-flash"
+
+@respx.mock
+def test_candidate_without_text_raises_instead_of_caching_empty(settings):
+    """A SAFETY/RECITATION stop returns a candidate with no parts; an empty
+    string would be cached as a successful translation forever."""
+    respx.post(GEMINI_URL).mock(return_value=httpx.Response(
+        200, json={"candidates": [{"finishReason": "SAFETY"}]}))
+    with pytest.raises(SarvamError, match="empty translation.*SAFETY"):
+        GeminiTranslator(settings, sleep=lambda s: None).to_english("x", "ta-IN")

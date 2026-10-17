@@ -93,7 +93,18 @@ class GeminiTranslator:
                 resp.text[:200],
             )
         parts = candidates[0].get("content", {}).get("parts") or []
-        return "".join(p["text"] for p in parts if p.get("text")).strip()
+        text = "".join(p["text"] for p in parts if p.get("text")).strip()
+        if not text:
+            # A SAFETY/RECITATION stop answers 200 with a text-less candidate.
+            # Returning "" would be cached as a translation; raising records a
+            # remembered failure, so the segment shows as mt_failed instead.
+            reason = candidates[0].get("finishReason") or "unknown"
+            raise SarvamError(
+                f"Gemini returned an empty translation (finishReason: {reason})",
+                resp.status_code,
+                resp.text[:200],
+            )
+        return text
 
     def to_english(self, text: str, src_lang: str) -> str:
         name = LANG_NAMES.get(src_lang, src_lang)
